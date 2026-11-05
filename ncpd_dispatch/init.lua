@@ -5,7 +5,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.2.0",
+    version = "0.2.1",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -294,7 +294,8 @@ local function pickScene()
                 return s[2]:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, 3.0, 8)
             end)
             if ok and snapped and (snapped.x ~= 0 or snapped.y ~= 0)
-                and math.abs(snapped.z - origin.z) < 15 then
+                and math.abs(snapped.z - origin.z) < 6 then   -- same level as V, not an upper floor
+                NCPD.nav = s[2]
                 return snapped, "navmesh/" .. s[1]
             end
             why[s[1]] = ok and ("returned " .. (snapped and ("%.0f %.0f %.0f"):format(snapped.x, snapped.y, snapped.z) or "nil"))
@@ -304,6 +305,22 @@ local function pickScene()
     for k, v in pairs(why) do log("navmesh " .. k .. ": " .. v) end
     local fwd = player:GetWorldForward()
     return Vector4.new(origin.x + fwd.x * 30, origin.y + fwd.y * 30, origin.z, 1), "fallback"
+end
+
+-- Snap one suspect's spot to the same walkable floor as the scene centre.
+-- Rejects points that moved far (other side of a wall) or changed level
+-- (an interior floor); those suspects stand at the centre instead.
+local function suspectSpot(center, x, y)
+    if NCPD.nav then
+        local ok, p = pcall(function()
+            return NCPD.nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(Vector4.new(x, y, center.z + 1.5, 1), 1.0, 3)
+        end)
+        if ok and p and (p.x ~= 0 or p.y ~= 0) and math.abs(p.z - center.z) < 1.2 then
+            local dx, dy = p.x - x, p.y - y
+            if dx * dx + dy * dy < 1.0 then return p, true end
+        end
+    end
+    return Vector4.new(center.x, center.y, center.z, 1), false
 end
 
 ---------------------------------------------------------------- calls
@@ -324,9 +341,12 @@ local function endCall(outcome)
     if not c then return end
     clearMappin()
     if outcome == "cleared" then
-        local pay = c.type.pay + 300 * #c.suspects
+        local caught = #c.suspects - c.fled
+        local pay = c.type.pay + 300 * caught
         local rep = c.type.rep
-        if c.nonlethal == #c.suspects then
+        if c.fled > 0 then pay = math.floor(pay * 0.75); rep = math.floor(rep / 2) end
+        local allAlive = c.fled == 0 and c.nonlethal == #c.suspects
+        if allAlive then
             pay = math.floor(pay * 1.5); rep = rep * 2
             NCPD.save.nonlethal = NCPD.save.nonlethal + 1
         end
@@ -337,10 +357,11 @@ local function endCall(outcome)
         NCPD.save.calls = NCPD.save.calls + 1
         NCPD.save.earned = NCPD.save.earned + pay
         writeSave()
-        local extra = (c.nonlethal == #c.suspects) and " All suspects taken alive: bonus." or ""
+        local extra = allAlive and " All suspects taken alive: bonus." or ""
+        if c.fled > 0 then extra = (" %d suspect%s got away."):format(c.fled, c.fled > 1 and "s" or "") end
         notify(("NCPD: Scene clear. %d eddies, %+d rep.%s"):format(pay, rep, extra), 7)
         if rankName() ~= before then notify("NCPD: Promoted to " .. rankName() .. "!", 8) end
-        log(("call cleared: pay %d rep %+d (nonlethal %d/%d)"):format(pay, rep, c.nonlethal, #c.suspects))
+        log(("call cleared: pay %d rep %+d (nonlethal %d/%d, fled %d)"):format(pay, rep, c.nonlethal, #c.suspects, c.fled))
     else
         NCPD.save.rep = math.max(0, NCPD.save.rep - 5)
         writeSave()
@@ -374,13 +395,16 @@ local function dispatchCall(prep)
     local des = Game.GetDynamicEntitySystem()
     local pool = NCPD.pools[faction]
     local suspects = {}
+    local centred = 0
     for i = 1, prep.count do
         local rec = pool[math.random(#pool)]
         local ok, id = pcall(function()
             local spec = DynamicEntitySpec.new()
             spec.recordID = TweakDBID.new(rec)
             local a = (i / prep.count) * math.pi * 2
-            spec.position = Vector4.new(pos.x + math.cos(a) * 2.5, pos.y + math.sin(a) * 2.5, pos.z, 1)
+            local spot, snapped = suspectSpot(pos, pos.x + math.cos(a) * 2.5, pos.y + math.sin(a) * 2.5)
+            if not snapped then centred = centred + 1 end
+            spec.position = spot
             spec.persistState = false
             spec.persistSpawn = false
             spec.alwaysSpawned = true
@@ -406,9 +430,11 @@ local function dispatchCall(prep)
 
     NCPD.call = {
         type = ctype, faction = faction, pos = pos, suspects = suspects,
-        mappin = mappin, nonlethal = 0, started = NCPD.now, civDead = false,
+        mappin = mappin, nonlethal = 0, fled = 0, started = NCPD.now, civDead = false,
+        lastProgress = NCPD.now,
     }
-    log(("call started: %s, %s x%d at %.0f %.0f %.0f (%s)"):format(ctype.title, faction, #suspects, pos.x, pos.y, pos.z, how))
+    log(("call started: %s, %s x%d at %.0f %.0f %.0f (%s, %d of %d at centre)"):format(
+        ctype.title, faction, #suspects, pos.x, pos.y, pos.z, how, centred, #suspects))
     return pos
 end
 
@@ -532,6 +558,7 @@ local function updateCall()
                 local down, dead = isDown(npc)
                 if down then
                     s.done = true
+                    c.lastProgress = NCPD.now
                     if not dead then c.nonlethal = c.nonlethal + 1 end
                 else
                     remaining = remaining + 1
@@ -542,6 +569,23 @@ local function updateCall()
         end
     end
     if remaining == 0 then endCall("cleared"); return end
+
+    -- Suspects V can't reach (stuck in geometry) shouldn't block the call:
+    -- if V is at the scene, someone is already down, and nothing has
+    -- changed for a minute, the rest "flee" and the call wraps up.
+    local here = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 60
+    if here and remaining < #c.suspects and NCPD.now - c.lastProgress > 60 then
+        for _, s in ipairs(c.suspects) do
+            if not s.done then
+                s.done = true
+                c.fled = c.fled + 1
+                pcall(function() des:DeleteEntity(s.id) end)
+            end
+        end
+        log(("%d suspect(s) unreachable for 60 s; counted as fled"):format(c.fled))
+        endCall("cleared")
+        return
+    end
 
     -- abandoned if V wanders far away after a few minutes
     local d = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos)
