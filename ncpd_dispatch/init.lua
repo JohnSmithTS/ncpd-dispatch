@@ -5,7 +5,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.2.1",
+    version = "0.3.0",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -323,6 +323,93 @@ local function suspectSpot(center, x, y)
     return Vector4.new(center.x, center.y, center.z, 1), false
 end
 
+---------------------------------------------------------------- learned spots
+
+-- Walkable street spots V has been near, one per 50 m cell, kept between
+-- sessions. Calls are sent to these so a far-away scene is on real ground
+-- (the navmesh only exists near V, so distant points can't be checked).
+local SPOTS_FILE = "ncpd_spots.json"
+NCPD.spots, NCPD.spotCells, NCPD.spotsDirty, NCPD.sampleIn = {}, {}, 0, 5
+
+local function cellKey(x, y) return math.floor(x / 50) .. ":" .. math.floor(y / 50) end
+
+local function writeSpots()
+    if NCPD.spotsDirty == 0 then return end
+    local f = io.open(SPOTS_FILE, "w")
+    if f then f:write(json.encode(NCPD.spots)); f:close(); NCPD.spotsDirty = 0 end
+end
+
+local function addSpot(p)
+    local k = cellKey(p.x, p.y)
+    if NCPD.spotCells[k] then return false end
+    NCPD.spotCells[k] = true
+    table.insert(NCPD.spots, { x = math.floor(p.x * 10) / 10, y = math.floor(p.y * 10) / 10, z = math.floor(p.z * 10) / 10 })
+    NCPD.spotsDirty = NCPD.spotsDirty + 1
+    if NCPD.spotsDirty >= 10 then writeSpots() end
+    return true
+end
+
+local function loadSpots()
+    local f = io.open(SPOTS_FILE, "r")
+    if not f then return end
+    local ok, data = pcall(json.decode, f:read("*a"))
+    f:close()
+    if ok and type(data) == "table" then
+        for _, p in ipairs(data) do
+            if p.x and p.y and p.z and not NCPD.spotCells[cellKey(p.x, p.y)] then
+                NCPD.spotCells[cellKey(p.x, p.y)] = true
+                table.insert(NCPD.spots, p)
+            end
+        end
+    end
+end
+
+local function navSystem()
+    if not NCPD.nav then pcall(function() NCPD.nav = Game.GetNavigationSystem() end) end
+    return NCPD.nav
+end
+
+-- Record the walkable floor right under V (street, sidewalk, plaza).
+local function sampleSpot()
+    local nav = navSystem()
+    if not nav then return end
+    local o = Game.GetPlayer():GetWorldPosition()
+    local ok, p = pcall(function()
+        return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(Vector4.new(o.x, o.y, o.z + 1.5, 1), 1.0, 3)
+    end)
+    if ok and p and (p.x ~= 0 or p.y ~= 0) and math.abs(p.z - o.z) < 3 then
+        local dx, dy = p.x - o.x, p.y - o.y
+        if dx * dx + dy * dy < 16 then addSpot(p) end
+    end
+end
+
+local function inVehicle()
+    local ok, v = pcall(function() return Game.GetMountedVehicle(Game.GetPlayer()) end)
+    return ok and v ~= nil
+end
+
+-- Where to send V: a learned spot at a sensible distance, or a rough point
+-- that gets snapped to real ground once V is close.
+local function pickTarget()
+    local o = Game.GetPlayer():GetWorldPosition()
+    local veh = inVehicle()
+    local lo, hi = 150, 400
+    if veh then lo, hi = 400, 1200 end
+    local cands = {}
+    for _, p in ipairs(NCPD.spots) do
+        local dx, dy = p.x - o.x, p.y - o.y
+        local d = math.sqrt(dx * dx + dy * dy)
+        if d >= lo and d <= hi and math.abs(p.z - o.z) < 40 then table.insert(cands, p) end
+    end
+    if #cands > 0 then
+        local p = cands[math.random(#cands)]
+        return Vector4.new(p.x, p.y, p.z, 1), "learned", veh
+    end
+    local a = math.random() * math.pi * 2
+    local d = lo + math.random() * (hi - lo)
+    return Vector4.new(o.x + math.cos(a) * d, o.y + math.sin(a) * d, o.z, 1), "rough", veh
+end
+
 ---------------------------------------------------------------- calls
 
 local function clearMappin()
@@ -362,6 +449,11 @@ local function endCall(outcome)
         notify(("NCPD: Scene clear. %d eddies, %+d rep.%s"):format(pay, rep, extra), 7)
         if rankName() ~= before then notify("NCPD: Promoted to " .. rankName() .. "!", 8) end
         log(("call cleared: pay %d rep %+d (nonlethal %d/%d, fled %d)"):format(pay, rep, c.nonlethal, #c.suspects, c.fled))
+    elseif outcome == "late" then
+        NCPD.save.rep = math.max(0, NCPD.save.rep - 2)
+        writeSave()
+        notify("NCPD: Too slow, another unit took the call. -2 rep.", 6)
+        log("call missed: did not arrive in time")
     else
         NCPD.save.rep = math.max(0, NCPD.save.rep - 5)
         writeSave()
@@ -387,21 +479,65 @@ local function prepareCall()
     return { type = ctype, faction = faction, count = math.random(ctype.min, ctype.max) }
 end
 
--- Spawn suspects at a fresh scene near V and set the marker.
-local function dispatchCall(prep)
-    local ctype, faction = prep.type, prep.faction
-    local pos, how = pickScene()
+local function setMappin(c, pos)
+    if c.mappin then pcall(function() Game.GetMappinSystem():UnregisterMappin(c.mappin) end) end
+    c.mappin = nil
+    pcall(function()
+        local data = MappinData.new()
+        data.mappinType = TweakDBID.new("Mappins.DefaultStaticMappin")
+        data.variant = gamedataMappinVariant.CustomPositionVariant
+        data.visibleThroughWalls = true
+        c.mappin = Game.GetMappinSystem():RegisterMappin(data, pos)
+    end)
+end
 
+-- Answering a call only sets a destination; suspects spawn when V is close.
+local function dispatchCall(prep)
+    local target, how, veh = pickTarget()
+    local dist = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), target)
+    local c = {
+        type = prep.type, faction = prep.faction, count = prep.count,
+        state = "enroute", target = target, targetHow = how, pos = target,
+        suspects = {}, nonlethal = 0, fled = 0, civDead = false,
+        started = NCPD.now, deadline = NCPD.now + 120 + dist / 6,
+    }
+    setMappin(c, target)
+    NCPD.call = c
+    log(("call dispatched: %s, %s x%d, %.0f m away (%s target, %s)"):format(
+        c.type.title, c.faction, c.count, dist, how, veh and "in vehicle" or "on foot"))
+    return target
+end
+
+-- Find walkable ground at the destination now that its navmesh is loaded.
+local function sceneCentre(c)
+    local nav = navSystem()
+    local ref = (c.targetHow == "learned") and c.target.z or Game.GetPlayer():GetWorldPosition().z
+    if nav then
+        for try = 1, 14 do
+            local r = (try <= 3) and 0 or ((try <= 8) and 20 or 45)
+            local ang = math.random() * math.pi * 2
+            local p = Vector4.new(c.target.x + math.cos(ang) * r, c.target.y + math.sin(ang) * r, ref + 4, 1)
+            local ok, sp = pcall(function() return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, 3.0, 8) end)
+            if ok and sp and (sp.x ~= 0 or sp.y ~= 0) and math.abs(sp.z - ref) < 6 then
+                return sp, "at target"
+            end
+        end
+    end
+    local p, how = pickScene()   -- last resort: a spot near V
+    return p, "near V (" .. how .. ")"
+end
+
+local function spawnScene(c)
+    local pos, how = sceneCentre(c)
     local des = Game.GetDynamicEntitySystem()
-    local pool = NCPD.pools[faction]
-    local suspects = {}
+    local pool = NCPD.pools[c.faction]
     local centred = 0
-    for i = 1, prep.count do
+    for i = 1, c.count do
         local rec = pool[math.random(#pool)]
         local ok, id = pcall(function()
             local spec = DynamicEntitySpec.new()
             spec.recordID = TweakDBID.new(rec)
-            local a = (i / prep.count) * math.pi * 2
+            local a = (i / c.count) * math.pi * 2
             local spot, snapped = suspectSpot(pos, pos.x + math.cos(a) * 2.5, pos.y + math.sin(a) * 2.5)
             if not snapped then centred = centred + 1 end
             spec.position = spot
@@ -412,30 +548,21 @@ local function dispatchCall(prep)
             return des:CreateEntity(spec)
         end)
         if ok and id then
-            table.insert(suspects, { id = id, record = rec, hostile = false, done = false })
+            table.insert(c.suspects, { id = id, record = rec, hostile = false, done = false })
         else
             log("spawn failed for " .. rec .. ": " .. tostring(id))
         end
     end
-    if #suspects == 0 then log("no suspects spawned; call cancelled"); return nil end
-
-    local mappin
-    pcall(function()
-        local data = MappinData.new()
-        data.mappinType = TweakDBID.new("Mappins.DefaultStaticMappin")
-        data.variant = gamedataMappinVariant.CustomPositionVariant
-        data.visibleThroughWalls = true
-        mappin = Game.GetMappinSystem():RegisterMappin(data, pos)
-    end)
-
-    NCPD.call = {
-        type = ctype, faction = faction, pos = pos, suspects = suspects,
-        mappin = mappin, nonlethal = 0, fled = 0, started = NCPD.now, civDead = false,
-        lastProgress = NCPD.now,
-    }
-    log(("call started: %s, %s x%d at %.0f %.0f %.0f (%s, %d of %d at centre)"):format(
-        ctype.title, faction, #suspects, pos.x, pos.y, pos.z, how, centred, #suspects))
-    return pos
+    if #c.suspects == 0 then return false end
+    c.pos = pos
+    c.state = "active"
+    c.arrivedAt = NCPD.now
+    c.lastProgress = NCPD.now
+    setMappin(c, pos)
+    addSpot(pos)
+    log(("scene spawned: %s x%d at %.0f %.0f %.0f (%s, %d of %d at centre)"):format(
+        c.faction, #c.suspects, pos.x, pos.y, pos.z, how, centred, #c.suspects))
+    return true
 end
 
 -- The phone rings; the call is answered automatically or with the hotkey.
@@ -470,7 +597,7 @@ local function answerCall()
         lines = {
             ("%s V, this is NCPD Dispatch. You're the closest unit."):format(rankName()),
             ("We have a %s about %d meters %s of you."):format(c.type.title:lower(), dist, dir),
-            ("Witnesses report %d %s. Approach with caution."):format(#c.suspects, c.faction),
+            ("Witnesses report %d %s. Approach with caution."):format(c.count, c.faction),
             "Location's on your map. Dispatch out.",
         },
     }
@@ -545,6 +672,18 @@ end
 
 local function updateCall()
     local c = NCPD.call
+    if c.state == "enroute" then
+        local d = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.target)
+        if d < 150 then
+            if not spawnScene(c) then
+                log("no suspects spawned; call cancelled")
+                clearMappin(); NCPD.call = nil; NCPD.timer = 0
+            end
+        elseif NCPD.now > c.deadline then
+            endCall("late")
+        end
+        return
+    end
     local des = Game.GetDynamicEntitySystem()
     local remaining = 0
     for _, s in ipairs(c.suspects) do
@@ -587,9 +726,9 @@ local function updateCall()
         return
     end
 
-    -- abandoned if V wanders far away after a few minutes
+    -- abandoned if V leaves the scene once it's under way
     local d = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos)
-    if d > 400 and NCPD.now - c.started > 120 then endCall("abandoned") end
+    if d > 400 and NCPD.now - c.arrivedAt > 30 then endCall("abandoned") end
 end
 
 ---------------------------------------------------------------- events
@@ -597,6 +736,8 @@ end
 registerForEvent("onInit", function()
     math.randomseed(os.time())
     loadSave()
+    loadSpots()
+    log(("%d learned street spots."):format(#NCPD.spots))
     log(("v%s loaded. Rank %s, rep %d, on duty: %s."):format(NCPD.version, rankName(), NCPD.save.rep, tostring(NCPD.save.onDuty)))
 end)
 
@@ -605,6 +746,7 @@ registerForEvent("onShutdown", function()
     hidePanel()
     clearMappin()
     despawnAll()
+    writeSpots()
 end)
 
 registerForEvent("onOverlayOpen", function() NCPD.overlayOpen = true end)
@@ -635,6 +777,12 @@ registerForEvent("onUpdate", function(dt)
             NCPD.greeted = true
             notify(("NCPD: %s V on duty. Stand by for calls."):format(rankName()), 6)
         end
+    end
+
+    NCPD.sampleIn = NCPD.sampleIn - dt
+    if NCPD.sampleIn <= 0 then
+        NCPD.sampleIn = 20
+        pcall(sampleSpot)
     end
 
     if NCPD.cleanupAt and NCPD.now > NCPD.cleanupAt and not NCPD.call then
@@ -692,7 +840,12 @@ registerForEvent("onDraw", function()
             local c, left = NCPD.call, 0
             for _, x in ipairs(c.suspects) do if not x.done then left = left + 1 end end
             ImGui.Text(("Active: %s (%s)"):format(c.type.title, c.faction))
-            ImGui.Text(("Suspects left: %d / %d"):format(left, #c.suspects))
+            if c.state == "enroute" then
+                local d = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.target)
+                ImGui.Text(("En route: %.0f m, %d s left"):format(d, math.max(0, math.floor(c.deadline - NCPD.now))))
+            else
+                ImGui.Text(("Suspects left: %d / %d"):format(left, #c.suspects))
+            end
             if ImGui.Button("Abandon call") then endCall("abandoned") end
         else
             if ImGui.Button("Request call now") then startCall() end
@@ -700,6 +853,7 @@ registerForEvent("onDraw", function()
         ImGui.SameLine()
         if ImGui.Button("Rebuild NPC pools") then buildPools() end
         ImGui.Separator()
+        ImGui.Text(("Learned street spots: %d"):format(#NCPD.spots))
         ImGui.TextWrapped("Last: " .. NCPD.lastLog)
     end
     ImGui.End()
