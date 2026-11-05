@@ -156,19 +156,28 @@ end
 local function pickScene()
     local player = Game.GetPlayer()
     local origin = player:GetWorldPosition()
-    local nav = Game.GetAINavigationSystem()
-    for _ = 1, 12 do
+    local systems = {}
+    pcall(function() table.insert(systems, { "AINav", Game.GetAINavigationSystem() }) end)
+    pcall(function() table.insert(systems, { "Nav", Game.GetNavigationSystem() }) end)
+    local why = {}
+    for try = 1, 16 do
         local ang = math.random() * math.pi * 2
         local dist = 60 + math.random() * 60
-        local p = Vector4.new(origin.x + math.cos(ang) * dist, origin.y + math.sin(ang) * dist, origin.z + 20, 1)
-        local ok, snapped = pcall(function()
-            return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, 1.0, 10)
-        end)
-        if ok and snapped and (snapped.x ~= 0 or snapped.y ~= 0)
-            and math.abs(snapped.z - origin.z) < 25 then
-            return snapped, "navmesh"
+        if try > 8 then dist = 30 + math.random() * 30 end   -- closer if far points fail
+        local p = Vector4.new(origin.x + math.cos(ang) * dist, origin.y + math.sin(ang) * dist, origin.z + 4, 1)
+        for _, s in ipairs(systems) do
+            local ok, snapped = pcall(function()
+                return s[2]:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, 3.0, 8)
+            end)
+            if ok and snapped and (snapped.x ~= 0 or snapped.y ~= 0)
+                and math.abs(snapped.z - origin.z) < 15 then
+                return snapped, "navmesh/" .. s[1]
+            end
+            why[s[1]] = ok and ("returned " .. (snapped and ("%.0f %.0f %.0f"):format(snapped.x, snapped.y, snapped.z) or "nil"))
+                or ("error " .. tostring(snapped))
         end
     end
+    for k, v in pairs(why) do log("navmesh " .. k .. ": " .. v) end
     local fwd = player:GetWorldForward()
     return Vector4.new(origin.x + fwd.x * 30, origin.y + fwd.y * 30, origin.z, 1), "fallback"
 end
