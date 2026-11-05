@@ -1,23 +1,35 @@
 -- NCPD Dispatch: an NCPD career for V.
--- Prototype v0.1: on-duty toggle, generated "crime in progress" calls built
+-- v0.2: dispatch calls arrive by phone (ring, caller-ID panel, dispatcher
+-- lines); on-duty toggle and settings remembered; generated "crime in progress" calls built
 -- from the game's own gang NPC records, map marker, payout, reputation, ranks.
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.1.0",
+    version = "0.2.0",
     tag = "NCPDDispatch",
     overlayOpen = false,
-    onDuty = false,
-    autoDispatch = true,
-    dispatchEvery = 240,        -- seconds between calls while on duty
     timer = 0,
     now = 0,                    -- game-time seconds, advanced in onUpdate
     call = nil,                 -- the active call
+    ring = nil,                 -- an incoming dispatch call that is ringing
+    dialog = nil,               -- dispatcher lines being shown
+    panel = nil,                -- HUD widgets for the phone panel
     pools = {},                 -- faction name -> list of record id strings
     poolsBuilt = false,
     lastLog = "",
-    save = { rep = 0, calls = 0, earned = 0, nonlethal = 0 },
+    save = {
+        rep = 0, calls = 0, earned = 0, nonlethal = 0,
+        -- settings (kept between sessions, so CET is only needed to change them)
+        onDuty = false,
+        autoDispatch = true,
+        autoAnswer = true,
+        dispatchEvery = 240,    -- seconds between calls while on duty
+    },
 }
+
+local RING_AUTO_ANSWER = 4      -- seconds of ringing before auto-answer
+local RING_TIMEOUT = 20         -- seconds before an unanswered call is missed
+local MISSED_RETRY = 90         -- seconds until dispatch tries again
 
 local SAVE_FILE = "ncpd_save.json"
 
@@ -103,6 +115,118 @@ local function giveMoney(amount)
         Game.GetTransactionSystem():GiveItem(Game.GetPlayer(), ItemID.FromTDBID(TweakDBID.new("Items.money")), amount)
     end)
     if not ok then log("payout failed: " .. tostring(err)) end
+end
+
+---------------------------------------------------------------- phone
+
+local function sound(name)
+    pcall(function() GameObject.PlaySoundEvent(Game.GetPlayer(), CName.new(name)) end)
+end
+
+local function stopSound(name)
+    pcall(function() GameObject.StopSoundEvent(Game.GetPlayer(), CName.new(name)) end)
+end
+
+local function gamePaused()
+    local ok, paused = pcall(function()
+        local h = Game.GetSystemRequestsHandler()
+        return h:IsPreGame() or h:IsGamePaused()
+    end)
+    return ok and paused
+end
+
+local function inCombat()
+    local ok, v = pcall(function()
+        local p = Game.GetPlayer()
+        local defs = GetAllBlackboardDefs()
+        local bb = Game.GetBlackboardSystem():GetLocalInstanced(p:GetEntityID(), defs.PlayerStateMachine)
+        return bb:GetInt(defs.PlayerStateMachine.Combat) == 1
+    end)
+    return ok and v
+end
+
+local function compass(from, to)
+    local dx, dy = to.x - from.x, to.y - from.y
+    local names = { "east", "north-east", "north", "north-west", "west", "south-west", "south", "south-east" }
+    local a = math.atan2 and math.atan2(dy, dx) or math.atan(dy, dx)
+    local i = math.floor(((a / (2 * math.pi)) * 8 + 0.5) % 8) + 1
+    return names[i], math.floor(math.sqrt(dx * dx + dy * dy) / 10 + 0.5) * 10
+end
+
+local FONT = "base\\gameplay\\gui\\fonts\\raj\\raj.inkfontfamily"
+local CYAN = { Red = 0.37, Green = 0.96, Blue = 1.0, Alpha = 1 }
+local RED = { Red = 1.0, Green = 0.33, Blue = 0.32, Alpha = 1 }
+
+local function hidePanel()
+    if NCPD.panel then
+        pcall(function() NCPD.panel.parent:RemoveChild(NCPD.panel.root) end)
+        NCPD.panel = nil
+    end
+end
+
+local function makeText(parent, size, color, top)
+    local t = inkText.new()
+    t:SetFontFamily(FONT)
+    t:SetFontStyle(CName.new("Medium"))
+    t:SetFontSize(size)
+    t:SetTintColor(HDRColor.new(color))
+    t:SetMargin(inkMargin.new({ left = 34, top = top, right = 0, bottom = 0 }))
+    pcall(function() t:SetWrapping(true, 560) end)
+    t:Reparent(parent, -1)
+    return t
+end
+
+-- Caller-ID style panel on the right of the HUD. Returns false if the HUD
+-- can't be reached (then the plain on-screen message is used instead).
+local function showPanel(title, body, color)
+    if NCPD.panel then
+        pcall(function()
+            NCPD.panel.title:SetText(title)
+            NCPD.panel.body:SetText(body)
+            NCPD.panel.title:SetTintColor(HDRColor.new(color or CYAN))
+            NCPD.panel.title:SetOpacity(1.0)
+        end)
+        return true
+    end
+    local ok, err = pcall(function()
+        local parent = Game.GetInkSystem():GetLayer(CName.new("inkHUDLayer")):GetVirtualWindow()
+        local root = inkCanvas.new()
+        root:SetName(CName.new("ncpd_phone_panel"))
+        root:SetAnchor(inkEAnchor.TopRight)
+        root:SetAnchorPoint(Vector2.new({ X = 1, Y = 0 }))
+        root:SetMargin(inkMargin.new({ left = 0, top = 300, right = 70, bottom = 0 }))
+        root:SetSize(Vector2.new({ X = 640, Y = 210 }))
+
+        local bg = inkRectangle.new()
+        bg:SetAnchor(inkEAnchor.Fill)
+        bg:SetTintColor(HDRColor.new({ Red = 0.03, Green = 0.05, Blue = 0.09, Alpha = 1 }))
+        bg:SetOpacity(0.85)
+        bg:Reparent(root, -1)
+
+        local bar = inkRectangle.new()
+        bar:SetAnchor(inkEAnchor.LeftFillVerticaly)
+        bar:SetSize(Vector2.new({ X = 8, Y = 210 }))
+        bar:SetTintColor(HDRColor.new(CYAN))
+        bar:Reparent(root, -1)
+
+        local t = makeText(root, 44, color or CYAN, 18)
+        t:SetText(title)
+        local b = makeText(root, 32, { Red = 0.92, Green = 0.92, Blue = 0.92, Alpha = 1 }, 82)
+        b:SetText(body)
+
+        root:Reparent(parent, -1)
+        NCPD.panel = { root = root, parent = parent, title = t, body = b }
+    end)
+    if not ok then
+        log("HUD panel unavailable: " .. tostring(err))
+        NCPD.panel = nil
+    end
+    return ok
+end
+
+-- Show a line in the panel, or as an on-screen message if the panel failed.
+local function say(title, body, seconds, color)
+    if not showPanel(title, body, color) then notify(title .. ": " .. body, seconds) end
 end
 
 ---------------------------------------------------------------- NPC pools
@@ -229,28 +353,33 @@ local function endCall(outcome)
     NCPD.cleanupAt = NCPD.now + 60
 end
 
-local function startCall()
-    if NCPD.call then log("a call is already active"); return end
+-- Choose what the call is about and where, without spawning anything yet.
+local function prepareCall()
     if not NCPD.poolsBuilt then buildPools() end
     local faction = pickFaction()
-    if not faction then log("no usable gang NPC records found; cannot dispatch"); return end
-
+    if not faction then log("no usable gang NPC records found; cannot dispatch"); return nil end
     local choices = {}
     for _, t in ipairs(CALL_TYPES) do
         if NCPD.save.rep >= (t.minRep or 0) then table.insert(choices, t) end
     end
     local ctype = choices[math.random(#choices)]
+    return { type = ctype, faction = faction, count = math.random(ctype.min, ctype.max) }
+end
+
+-- Spawn suspects at a fresh scene near V and set the marker.
+local function dispatchCall(prep)
+    local ctype, faction = prep.type, prep.faction
     local pos, how = pickScene()
 
     local des = Game.GetDynamicEntitySystem()
     local pool = NCPD.pools[faction]
     local suspects = {}
-    for i = 1, math.random(ctype.min, ctype.max) do
+    for i = 1, prep.count do
         local rec = pool[math.random(#pool)]
         local ok, id = pcall(function()
             local spec = DynamicEntitySpec.new()
             spec.recordID = TweakDBID.new(rec)
-            local a = (i / ctype.max) * math.pi * 2
+            local a = (i / prep.count) * math.pi * 2
             spec.position = Vector4.new(pos.x + math.cos(a) * 2.5, pos.y + math.sin(a) * 2.5, pos.z, 1)
             spec.persistState = false
             spec.persistSpawn = false
@@ -264,7 +393,7 @@ local function startCall()
             log("spawn failed for " .. rec .. ": " .. tostring(id))
         end
     end
-    if #suspects == 0 then log("no suspects spawned; call cancelled"); return end
+    if #suspects == 0 then log("no suspects spawned; call cancelled"); return nil end
 
     local mappin
     pcall(function()
@@ -279,8 +408,98 @@ local function startCall()
         type = ctype, faction = faction, pos = pos, suspects = suspects,
         mappin = mappin, nonlethal = 0, started = NCPD.now, civDead = false,
     }
-    notify(("NCPD DISPATCH: %s. %s suspects, %d reported. Marker set."):format(ctype.title, faction, #suspects), 8)
     log(("call started: %s, %s x%d at %.0f %.0f %.0f (%s)"):format(ctype.title, faction, #suspects, pos.x, pos.y, pos.z, how))
+    return pos
+end
+
+-- The phone rings; the call is answered automatically or with the hotkey.
+local function startCall()
+    if NCPD.call or NCPD.ring or NCPD.dialog then log("a call is already active or ringing"); return end
+    local prep = prepareCall()
+    if not prep then return end
+    NCPD.ring = { prep = prep, t = 0 }
+    sound("ui_phone_incoming_call")
+    local hint = NCPD.save.autoAnswer and "Connecting..." or "Answer with your NCPD answer key"
+    say("INCOMING CALL", "NCPD Dispatch\n" .. hint, 6)
+    log("phone ringing: " .. prep.type.title .. " / " .. prep.faction)
+end
+
+local function answerCall()
+    local r = NCPD.ring
+    if not r then return end
+    NCPD.ring = nil
+    stopSound("ui_phone_incoming_call")
+    sound("ui_phone_incoming_call_stop")
+    sound("ui_phone_incoming_call_positive")
+    local pos = dispatchCall(r.prep)
+    if not pos then
+        say("NCPD DISPATCH", "Disregard, unit. Situation resolved.", 5)
+        NCPD.dialog = { lines = { }, t = 0, i = 0, hold = 4 }
+        return
+    end
+    local dir, dist = compass(Game.GetPlayer():GetWorldPosition(), pos)
+    local c = NCPD.call
+    NCPD.dialog = {
+        t = 0, i = 0,
+        lines = {
+            ("%s V, this is NCPD Dispatch. You're the closest unit."):format(rankName()),
+            ("We have a %s about %d meters %s of you."):format(c.type.title:lower(), dist, dir),
+            ("Witnesses report %d %s. Approach with caution."):format(#c.suspects, c.faction),
+            "Location's on your map. Dispatch out.",
+        },
+    }
+end
+
+local function declineCall(missed)
+    if not NCPD.ring then return end
+    NCPD.ring = nil
+    stopSound("ui_phone_incoming_call")
+    sound("ui_phone_incoming_call_stop")
+    if missed then
+        say("MISSED CALL", "NCPD Dispatch\nThey'll try again shortly.", 5, RED)
+        NCPD.timer = math.max(0, NCPD.save.dispatchEvery - MISSED_RETRY)
+        log("call missed")
+    else
+        say("CALL DECLINED", "NCPD Dispatch", 4, RED)
+        NCPD.timer = 0
+        log("call declined")
+    end
+    NCPD.dialog = { lines = {}, t = 0, i = 0, hold = 4 }
+end
+
+local function updateRing(dt)
+    local r = NCPD.ring
+    r.t = r.t + dt
+    if NCPD.panel then
+        pcall(function() NCPD.panel.title:SetOpacity((math.floor(r.t * 2) % 2 == 0) and 1.0 or 0.45) end)
+    end
+    if NCPD.save.autoAnswer and r.t >= RING_AUTO_ANSWER then
+        answerCall()
+    elseif r.t >= RING_TIMEOUT then
+        declineCall(true)
+    end
+end
+
+-- Steps through dispatcher lines (3.5 s each), then hides the panel.
+-- A dialog with no lines just keeps the current panel up for `hold` seconds.
+local function updateDialog(dt)
+    local d = NCPD.dialog
+    d.t = d.t + dt
+    if d.i == 0 then
+        d.i, d.t = 1, 0
+        if d.lines[1] then say("NCPD DISPATCH", d.lines[1], 4) end
+        return
+    end
+    local stay = d.lines[d.i] and 3.5 or (d.hold or 0)
+    if d.t < stay then return end
+    d.i, d.t = d.i + 1, 0
+    if d.lines[d.i] then
+        say("NCPD DISPATCH", d.lines[d.i], 4)
+    else
+        if d.lines[1] then sound("ui_phone_sms") end
+        hidePanel()
+        NCPD.dialog = nil
+    end
 end
 
 local function isDown(npc)
@@ -334,58 +553,100 @@ end
 registerForEvent("onInit", function()
     math.randomseed(os.time())
     loadSave()
-    log(("v%s loaded. Rank %s, rep %d."):format(NCPD.version, rankName(), NCPD.save.rep))
+    log(("v%s loaded. Rank %s, rep %d, on duty: %s."):format(NCPD.version, rankName(), NCPD.save.rep, tostring(NCPD.save.onDuty)))
 end)
 
 registerForEvent("onShutdown", function()
+    stopSound("ui_phone_incoming_call")
+    hidePanel()
     clearMappin()
     despawnAll()
 end)
 
 registerForEvent("onOverlayOpen", function() NCPD.overlayOpen = true end)
-registerForEvent("onOverlayClose", function() NCPD.overlayOpen = false end)
+registerForEvent("onOverlayClose", function()
+    NCPD.overlayOpen = false
+    writeSave()   -- keep any settings changed in the window
+end)
 
 registerHotkey("ncpd_duty", "Toggle NCPD duty", function()
-    NCPD.onDuty = not NCPD.onDuty
+    NCPD.save.onDuty = not NCPD.save.onDuty
     NCPD.timer = 0
-    notify(NCPD.onDuty and ("NCPD: On duty. " .. rankName() .. ", stand by for calls.") or "NCPD: Off duty.", 5)
+    writeSave()
+    notify(NCPD.save.onDuty and ("NCPD: On duty. " .. rankName() .. ", stand by for calls.") or "NCPD: Off duty.", 5)
 end)
 
 registerHotkey("ncpd_call", "Request NCPD call now", function() startCall() end)
+registerHotkey("ncpd_answer", "Answer NCPD call", function() answerCall() end)
+registerHotkey("ncpd_decline", "Decline NCPD call", function() declineCall(false) end)
 
 registerForEvent("onUpdate", function(dt)
     NCPD.now = NCPD.now + dt
-    if not Game.GetPlayer() then return end
+    if not Game.GetPlayer() or gamePaused() then return end
+
+    -- say hello once per session if duty was left on
+    if NCPD.save.onDuty and not NCPD.greeted then
+        NCPD.greetIn = (NCPD.greetIn or 15) - dt
+        if NCPD.greetIn <= 0 then
+            NCPD.greeted = true
+            notify(("NCPD: %s V on duty. Stand by for calls."):format(rankName()), 6)
+        end
+    end
+
     if NCPD.cleanupAt and NCPD.now > NCPD.cleanupAt and not NCPD.call then
         despawnAll(); NCPD.cleanupAt = nil
     end
+
+    if NCPD.ring then
+        local ok, err = pcall(updateRing, dt)
+        if not ok then log("ring error: " .. tostring(err)); NCPD.ring = nil end
+    end
+    if NCPD.dialog then
+        local ok, err = pcall(updateDialog, dt)
+        if not ok then log("dialog error: " .. tostring(err)); NCPD.dialog = nil; hidePanel() end
+    end
+
     if NCPD.call then
         local ok, err = pcall(updateCall)
         if not ok then log("update error: " .. tostring(err)) end
-    elseif NCPD.onDuty and NCPD.autoDispatch then
+    elseif NCPD.save.onDuty and NCPD.save.autoDispatch and not NCPD.ring and not NCPD.dialog then
         NCPD.timer = NCPD.timer + dt
-        if NCPD.timer >= NCPD.dispatchEvery then NCPD.timer = 0; startCall() end
+        if NCPD.timer >= NCPD.save.dispatchEvery then
+            if inCombat() then
+                NCPD.timer = NCPD.save.dispatchEvery - 30   -- busy; try again soon
+            else
+                NCPD.timer = 0
+                startCall()
+            end
+        end
     end
 end)
 
 registerForEvent("onDraw", function()
     if not NCPD.overlayOpen then return end
     ImGui.SetNextWindowPos(80, 300, ImGuiCond.FirstUseEver)
-    ImGui.SetNextWindowSize(420, 260, ImGuiCond.FirstUseEver)
+    ImGui.SetNextWindowSize(420, 300, ImGuiCond.FirstUseEver)
     if ImGui.Begin("NCPD Dispatch") then
-        ImGui.Text(("Rank: %s   Rep: %d"):format(rankName(), NCPD.save.rep))
-        ImGui.Text(("Calls cleared: %d   Taken alive: %d   Earned: %d"):format(NCPD.save.calls, NCPD.save.nonlethal, NCPD.save.earned))
+        local s = NCPD.save
+        ImGui.Text(("Rank: %s   Rep: %d"):format(rankName(), s.rep))
+        ImGui.Text(("Calls cleared: %d   Taken alive: %d   Earned: %d"):format(s.calls, s.nonlethal, s.earned))
         ImGui.Separator()
-        NCPD.onDuty = ImGui.Checkbox("On duty", NCPD.onDuty)
-        NCPD.autoDispatch = ImGui.Checkbox("Automatic calls", NCPD.autoDispatch)
-        NCPD.dispatchEvery = ImGui.SliderInt("Seconds between calls", NCPD.dispatchEvery, 60, 900)
-        if NCPD.onDuty and not NCPD.call and NCPD.autoDispatch then
-            ImGui.Text(("Next call in %d s"):format(math.max(0, NCPD.dispatchEvery - math.floor(NCPD.timer))))
+        s.onDuty = ImGui.Checkbox("On duty (remembered)", s.onDuty)
+        s.autoDispatch = ImGui.Checkbox("Automatic calls", s.autoDispatch)
+        s.autoAnswer = ImGui.Checkbox("Auto-answer dispatch calls", s.autoAnswer)
+        s.dispatchEvery = ImGui.SliderInt("Seconds between calls", s.dispatchEvery, 60, 900)
+        if s.onDuty and not NCPD.call and s.autoDispatch then
+            ImGui.Text(("Next call in %d s"):format(math.max(0, s.dispatchEvery - math.floor(NCPD.timer))))
         end
         ImGui.Separator()
-        if NCPD.call then
+        if NCPD.ring then
+            ImGui.Text("Phone ringing: NCPD Dispatch")
+            if ImGui.Button("Answer") then answerCall() end
+            ImGui.SameLine()
+            if ImGui.Button("Decline") then declineCall(false) end
+        elseif NCPD.call then
             local c, left = NCPD.call, 0
-            for _, s in ipairs(c.suspects) do if not s.done then left = left + 1 end end
+            for _, x in ipairs(c.suspects) do if not x.done then left = left + 1 end end
             ImGui.Text(("Active: %s (%s)"):format(c.type.title, c.faction))
             ImGui.Text(("Suspects left: %d / %d"):format(left, #c.suspects))
             if ImGui.Button("Abandon call") then endCall("abandoned") end
