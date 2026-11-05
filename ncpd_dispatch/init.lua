@@ -361,6 +361,8 @@ end)
 
 registerForEvent("onDraw", function()
     if not NCPD.overlayOpen then return end
+    ImGui.SetNextWindowPos(80, 300, ImGuiCond.FirstUseEver)
+    ImGui.SetNextWindowSize(420, 260, ImGuiCond.FirstUseEver)
     if ImGui.Begin("NCPD Dispatch") then
         ImGui.Text(("Rank: %s   Rep: %d"):format(rankName(), NCPD.save.rep))
         ImGui.Text(("Calls cleared: %d   Taken alive: %d   Earned: %d"):format(NCPD.save.calls, NCPD.save.nonlethal, NCPD.save.earned))
