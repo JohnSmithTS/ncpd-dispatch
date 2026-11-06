@@ -1,12 +1,11 @@
 -- NCPD Dispatch: an NCPD career for V.
--- v0.2: dispatch calls arrive by phone (ring, caller-ID panel, dispatcher
--- lines); on-duty toggle and settings remembered; generated "crime in progress" calls built
+-- v0.2: dispatch calls arrive by phone (ring, dispatcher lines); on-duty toggle and settings remembered; generated "crime in progress" calls built
 -- from the game's own gang NPC records, map marker, payout, reputation, ranks.
 -- v0.4: surprise heavies, gang wars between two factions, NCPD backup.
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.8.4",
+    version = "0.8.5",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -14,7 +13,6 @@ local NCPD = {
     call = nil,                 -- the active call
     ring = nil,                 -- an incoming dispatch call that is ringing
     dialog = nil,               -- dispatcher lines being shown
-    panel = nil,                -- HUD widgets for the phone panel
     pools = {},                 -- faction name -> list of record id strings
     bossPools = {},             -- faction name -> tougher (Elite/Officer) records
     copPool = {},               -- NCPD officer records for backup
@@ -184,77 +182,6 @@ local function compass(from, to)
     return names[i], math.floor(math.sqrt(dx * dx + dy * dy) / 10 + 0.5) * 10
 end
 
-local FONT = "base\\gameplay\\gui\\fonts\\raj\\raj.inkfontfamily"
-local CYAN = { Red = 0.37, Green = 0.96, Blue = 1.0, Alpha = 1 }
-local RED = { Red = 1.0, Green = 0.33, Blue = 0.32, Alpha = 1 }
-
-local function hidePanel()
-    if NCPD.panel then
-        pcall(function() NCPD.panel.parent:RemoveChild(NCPD.panel.root) end)
-        NCPD.panel = nil
-    end
-end
-
-local function makeText(parent, size, color, top)
-    local t = inkText.new()
-    t:SetFontFamily(FONT)
-    t:SetFontStyle(CName.new("Medium"))
-    t:SetFontSize(size)
-    t:SetTintColor(HDRColor.new(color))
-    t:SetMargin(inkMargin.new({ left = 34, top = top, right = 0, bottom = 0 }))
-    pcall(function() t:SetWrapping(true, 560) end)
-    t:Reparent(parent, -1)
-    return t
-end
-
--- Caller-ID style panel on the right of the HUD. Returns false if the HUD
--- can't be reached (then the plain on-screen message is used instead).
-local function showPanel(title, body, color)
-    if NCPD.panel then
-        pcall(function()
-            NCPD.panel.title:SetText(title)
-            NCPD.panel.body:SetText(body)
-            NCPD.panel.title:SetTintColor(HDRColor.new(color or CYAN))
-            NCPD.panel.title:SetOpacity(1.0)
-        end)
-        return true
-    end
-    local ok, err = pcall(function()
-        local parent = Game.GetInkSystem():GetLayer(CName.new("inkHUDLayer")):GetVirtualWindow()
-        local root = inkCanvas.new()
-        root:SetName(CName.new("ncpd_phone_panel"))
-        root:SetAnchor(inkEAnchor.TopRight)
-        root:SetAnchorPoint(Vector2.new({ X = 1, Y = 0 }))
-        root:SetMargin(inkMargin.new({ left = 0, top = 300, right = 70, bottom = 0 }))
-        root:SetSize(Vector2.new({ X = 640, Y = 210 }))
-
-        local bg = inkRectangle.new()
-        bg:SetAnchor(inkEAnchor.Fill)
-        bg:SetTintColor(HDRColor.new({ Red = 0.03, Green = 0.05, Blue = 0.09, Alpha = 1 }))
-        bg:SetOpacity(0.85)
-        bg:Reparent(root, -1)
-
-        local bar = inkRectangle.new()
-        bar:SetAnchor(inkEAnchor.LeftFillVerticaly)
-        bar:SetSize(Vector2.new({ X = 8, Y = 210 }))
-        bar:SetTintColor(HDRColor.new(CYAN))
-        bar:Reparent(root, -1)
-
-        local t = makeText(root, 44, color or CYAN, 18)
-        t:SetText(title)
-        local b = makeText(root, 32, { Red = 0.92, Green = 0.92, Blue = 0.92, Alpha = 1 }, 82)
-        b:SetText(body)
-
-        root:Reparent(parent, -1)
-        NCPD.panel = { root = root, parent = parent, title = t, body = b }
-    end)
-    if not ok then
-        log("HUD panel unavailable: " .. tostring(err))
-        NCPD.panel = nil
-    end
-    return ok
-end
-
 -- Real phone texts: entries added to the game's ncpd_dispatcher contact by
 -- ncpd_dispatch.archive (ArchiveXL journal merge). A message is (re)sent by
 -- switching it to Inactive and back to Active with a notification.
@@ -344,9 +271,13 @@ end
 
 local function rankSlug(name) return (name:lower():gsub(" ", "_")) end
 
--- Show a line in the panel, or as an on-screen message if the panel failed.
-local function say(title, body, seconds, color)
-    if not showPanel(title, body, color) then notify(title .. ": " .. body, seconds) end
+-- Dispatcher status line. With phone texts on, lines the phone already
+-- shows (phoneToo) are skipped; the rest use the game's own on-screen message.
+-- (v0.2-0.8.4 drew a caller-ID panel on the HUD; it didn't scale with the
+-- UI and is redundant now that dispatch uses the phone.)
+local function say(title, body, seconds, phoneToo)
+    if phoneToo and NCPD.save.phoneTexts then return end
+    notify(title .. ": " .. (body:gsub("\n", " - ")), seconds)
 end
 
 ---------------------------------------------------------------- NPC pools
@@ -1341,8 +1272,7 @@ local function startCall()
     if not prep then return end
     NCPD.ring = { prep = prep, t = 0 }
     sound("ui_phone_incoming_call")
-    local hint = NCPD.save.autoAnswer and "Connecting..." or "Answer with your NCPD answer key"
-    say("INCOMING CALL", "NCPD Dispatch\n" .. hint, 6)
+    if not NCPD.save.autoAnswer then say("INCOMING CALL", "NCPD Dispatch - answer with your NCPD answer key", 6) end
     log("phone ringing: " .. prep.type.title .. " / " .. prep.faction)
 end
 
@@ -1366,7 +1296,7 @@ local function answerCall()
     local what = prep.faction2 and (prep.faction .. " vs " .. prep.faction2) or prep.faction
     if prep.site then what = what .. " in " .. (NCPD.districtName[prep.site.district] or prep.site.district) end
     say("NCPD DISPATCH", ("%s, %s.\nCan you take it? %s"):format(prep.type.title, what,
-        phone and "Reply by text or use your NCPD keys." or "Use your NCPD answer / decline keys."), OFFER_TIMEOUT)
+        "Use your NCPD answer / decline keys."), OFFER_TIMEOUT, phone)
     log("call offered: " .. prep.type.title .. " / " .. what)
 end
 
@@ -1382,12 +1312,12 @@ local function resolveOffer(accept, how)
     if not accept then
         if how == "timeout" then
             text("offer_timeout")
-            say("NO REPLY", "NCPD Dispatch\nThe call went to another unit.", 5, RED)
+            say("NO REPLY", "NCPD Dispatch\nThe call went to another unit.", 5, true)
             NCPD.timer = math.max(0, NCPD.save.dispatchEvery - MISSED_RETRY)
             log("call not confirmed in time")
         else
             text("deny_ack")
-            say("CALL DECLINED", "NCPD Dispatch\nPassed to another unit.", 4, RED)
+            say("CALL DECLINED", "NCPD Dispatch\nPassed to another unit.", 4, true)
             NCPD.timer = 0
             log("call declined (" .. how .. ")")
         end
@@ -1404,18 +1334,18 @@ local function resolveOffer(accept, how)
     text("confirm_ack")
     local dir, dist = compass(Game.GetPlayer():GetWorldPosition(), pos)
     local c = NCPD.call
-    NCPD.dialog = {
-        t = 0, i = 0,
-        lines = {
-            ("Copy that, %s V. You're the closest unit."):format(rankName()),
-            ("We have a %s about %d meters %s of you."):format(c.type.title:lower(), dist, dir),
-            c.faction2 and ("%s and %s are shooting it out, %d on %d. Let them thin each other out if you like."):format(
-                c.faction, c.faction2, c.count, c.count2)
-                or ("Witnesses report %d %s%s. Approach with caution."):format(c.count, c.faction,
-                    c.victimCount > 0 and ", civilians caught in it" or ""),
-            "Location's on your map. Dispatch out.",
-        },
+    local situation = c.faction2 and ("%s and %s are shooting it out, %d on %d. Let them thin each other out if you like."):format(
+            c.faction, c.faction2, c.count, c.count2)
+        or ("Witnesses report %d %s%s. Approach with caution."):format(c.count, c.faction,
+            c.victimCount > 0 and ", civilians caught in it" or "")
+    -- the phone already said "location's on your map"; only the situation is new
+    local lines = NCPD.save.phoneTexts and { situation } or {
+        ("Copy that, %s V. You're the closest unit."):format(rankName()),
+        ("We have a %s about %d meters %s of you."):format(c.type.title:lower(), dist, dir),
+        situation,
+        "Location's on your map. Dispatch out.",
     }
+    NCPD.dialog = { t = 0, i = 0, lines = lines }
 end
 
 local function declineCall(missed)
@@ -1424,12 +1354,11 @@ local function declineCall(missed)
     stopSound("ui_phone_incoming_call")
     sound("ui_phone_incoming_call_stop")
     if missed then
-        say("MISSED CALL", "NCPD Dispatch\nThey'll try again shortly.", 5, RED)
+        say("MISSED CALL", "NCPD Dispatch\nThey'll try again shortly.", 5, true)
         text("missed_call")
         NCPD.timer = math.max(0, NCPD.save.dispatchEvery - MISSED_RETRY)
         log("call missed")
     else
-        say("CALL DECLINED", "NCPD Dispatch", 4, RED)
         NCPD.timer = 0
         log("call declined")
     end
@@ -1452,9 +1381,6 @@ end
 local function updateRing(dt)
     local r = NCPD.ring
     r.t = r.t + dt
-    if NCPD.panel then
-        pcall(function() NCPD.panel.title:SetOpacity((math.floor(r.t * 2) % 2 == 0) and 1.0 or 0.45) end)
-    end
     if NCPD.save.autoAnswer and r.t >= RING_AUTO_ANSWER then
         answerCall()
     elseif r.t >= RING_TIMEOUT then
@@ -1462,24 +1388,23 @@ local function updateRing(dt)
     end
 end
 
--- Steps through dispatcher lines (3.5 s each), then hides the panel.
--- A dialog with no lines just keeps the current panel up for `hold` seconds.
+-- Steps through dispatcher lines (3.5 s each). A dialog with no lines just
+-- waits `hold` seconds. phoneToo: the phone text covers it (skipped then).
 local function updateDialog(dt)
     local d = NCPD.dialog
     d.t = d.t + dt
     if d.i == 0 then
         d.i, d.t = 1, 0
-        if d.lines[1] then say("NCPD DISPATCH", d.lines[1], 4) end
+        if d.lines[1] then say("NCPD DISPATCH", d.lines[1], 4, d.phoneToo) end
         return
     end
     local stay = d.lines[d.i] and 3.5 or (d.hold or 0)
     if d.t < stay then return end
     d.i, d.t = d.i + 1, 0
     if d.lines[d.i] then
-        say("NCPD DISPATCH", d.lines[d.i], 4)
+        say("NCPD DISPATCH", d.lines[d.i], 4, d.phoneToo)
     else
-        if d.lines[1] then sound("ui_phone_sms") end
-        hidePanel()
+        if d.lines[1] and not (d.phoneToo and NCPD.save.phoneTexts) then sound("ui_phone_sms") end
         NCPD.dialog = nil
     end
 end
@@ -1678,12 +1603,12 @@ local function updateCall()
             NCPD.dialog = { t = 0, i = 0, lines = {
                 "V, heads up! Heavy incoming, " .. c.faction .. " sent a hitter.",
                 "Watch yourself. Dispatch out.",
-            } }
+            }, phoneToo = true }
             sound("ui_phone_incoming_call_positive")
             log("heavy warning radioed")
             text("heavy_warning")
         end
-        if c.bossAt and NCPD.now >= c.bossAt then spawnBoss(c) end
+        if c.bossAt and NCPD.now >= c.bossAt then spawnBoss(c); return end   -- count it next frame
         if c.boss and not c.bossSpawned then return end   -- don't finish before the heavy shows
     end
 
@@ -1751,7 +1676,6 @@ registerForEvent("onShutdown", function()
     restorePolice("shutdown")
     if NCPD.call then pcall(questEnd, NCPD.call, "cancelled") end
     stopSound("ui_phone_incoming_call")
-    hidePanel()
     clearMappin()
     despawnAll()
     writeSpots()
@@ -1814,11 +1738,11 @@ registerForEvent("onUpdate", function(dt)
     end
     if NCPD.offer then
         local ok, err = pcall(updateOffer, dt)
-        if not ok then log("offer error: " .. tostring(err)); NCPD.offer = nil; hidePanel() end
+        if not ok then log("offer error: " .. tostring(err)); NCPD.offer = nil end
     end
     if NCPD.dialog then
         local ok, err = pcall(updateDialog, dt)
-        if not ok then log("dialog error: " .. tostring(err)); NCPD.dialog = nil; hidePanel() end
+        if not ok then log("dialog error: " .. tostring(err)); NCPD.dialog = nil end
     end
 
     if NCPD.call then
