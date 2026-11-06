@@ -5,7 +5,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.9.0",
+    version = "0.9.1",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -1572,6 +1572,7 @@ local function updateCall()
     -- when V closes in, every suspect turns on V
     if not c.engagedV and Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 35 then
         c.engagedV = true
+        c.lastProgress = NCPD.now   -- the stall clocks start when V arrives, not at spawn
         local n = 0
         for _, s in ipairs(c.suspects) do
             if not s.done then
@@ -1630,7 +1631,8 @@ local function updateCall()
                 if s.lastPos and (not nd or d < nd) then nearest, nd = s.lastPos, d end
             end
         end
-        if nearest then
+        -- no hint while V is in the thick of it (nearest within 30 m)
+        if nearest and nd > 30 then
             local dir, dist = compass(me, nearest)
             notify(("NCPD: %d suspect%s left. Nearest about %d m %s."):format(remaining, remaining > 1 and "s" or "", dist, dir), 5)
         end
