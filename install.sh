@@ -8,6 +8,7 @@ G=~/snap/steam/common/.local/share/Steam/steamapps/common/"Cyberpunk 2077"
 DEST="$G/bin/x64/plugins/cyber_engine_tweaks/mods/ncpd_dispatch"
 mkdir -p "$DEST"
 cp "$HERE/ncpd_dispatch/init.lua" "$DEST/init.lua"
+cp "$HERE/phone/sites.json" "$DEST/sites.json"   # call sites (same list the archive's pins use)
 echo "Installed Lua to $DEST. In game: CET overlay -> Reload all mods."
 if [ -f "$HERE/phone/out/ncpd_dispatch.archive" ]; then
     mkdir -p "$G/archive/pc/mod"

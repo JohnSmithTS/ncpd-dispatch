@@ -102,52 +102,73 @@ for key, tmpl in q["objectives"].items():
         else:
             objectives.append((f"respond_{key}_{slug}", tmpl.replace("{Gang}", name)))
 
-def make_objective(oid):
+# Call sites: the game's own "Assault in Progress" locations (sites.json,
+# made by extract_sites.py). One objective per district, "Get to the scene:
+# <district>", holds one map pin per site there; the mod activates the pin of
+# the call's site and tracks that objective (GPS + distance). The named
+# objective above has no pin; the tracker lists both active objectives.
+sites_spec = json.load(open(os.path.join(os.path.dirname(os.path.abspath(src)), "sites.json")))
+anchor = sites_spec["anchor"]
+districts = sites_spec["districts"]
+by_district = {}
+for st in sites_spec["sites"]:
+    by_district.setdefault(st["district"], []).append(st)
+
+def empty_objective(oid, entries=()):
     return {"HandleId": h(), "Data": {
-    "$type": "gameJournalQuestObjective",
-    "counter": 0,
-    "description": loc("quest_obj_" + oid),
-    "districtID": "",
-    "entries": [{"HandleId": h(), "Data": {
+        "$type": "gameJournalQuestObjective",
+        "counter": 0,
+        "description": loc("quest_obj_" + oid),
+        "districtID": "",
+        "entries": list(entries),
+        "id": oid,
+        "itemID": ref_none("TweakDBID", "uint64", "0"),
+        "journalEntryOverrideDataList": [],
+        "locationPrefabRef": ref_none("NodeRef", "uint64", "0"),
+        "optional": 0,
+    }}
+
+def site_pin(st):
+    # A quest pin needs a node reference or it is never spawned; ArchiveXL puts
+    # it at anchor node + offset, once, when the pin entry is activated (it
+    # can't be moved later). The anchor is in an always-loaded sector, so it
+    # resolves wherever V is.
+    ax, ay, az = anchor["pos"]
+    return {"HandleId": h(), "Data": {
         "$type": "gameJournalQuestMapPin",
         "enableGPS": 1,
         "entries": [],
-        "id": "call_mappin",
+        "id": "site_" + st["id"],
         "journalEntryOverrideDataList": [],
         "mappinData": {
             "$type": "gamemappinsMappinData",
             "active": 1,
             "debugCaption": "",
-            # the pin's name on the map: the objective text
-            "localizedCaption": loc("quest_obj_" + oid),
+            "localizedCaption": loc("pin_" + st["district"]),
             "mappinType": ref_none("TweakDBID", "string", "Mappins.QuestStaticMappinDefinition"),
             "scriptData": None,
             "variant": q.get("variant", "DefaultQuestVariant"),
             "visibleThroughWalls": 1,
         },
-        # A quest pin with no node reference is never spawned. ArchiveXL puts
-        # it at anchor node + offset; the anchor is a base-game node in an
-        # always-loaded sector, so it resolves wherever V is. The mod then
-        # moves the pin to each call with MappinSystem.SetMappinPosition.
-        "offset": {"$type": "Vector3", "X": 0.0, "Y": 0.0, "Z": 0.5},
+        "offset": {"$type": "Vector3", "X": round(st["x"] - ax, 4), "Y": round(st["y"] - ay, 4),
+                   "Z": round(st["z"] - az, 4)},
         "reference": {
             "$type": "gameEntityReference",
             "dynamicEntityUniqueName": ref_none("CName"),
             "names": [],
-            "reference": {"$type": "NodeRef", "$storage": "string", "$value": q["anchor"]["node"]},
+            "reference": {"$type": "NodeRef", "$storage": "string", "$value": anchor["node"]},
             "sceneActorContextName": ref_none("CName"),
             "slotName": ref_none("CName"),
             "type": "EntityRef",
         },
         "slotName": ref_none("CName"),
         "uiAnimation": ref_none("TweakDBID", "uint64", "0"),
-    }}],
-    "id": oid,
-    "itemID": ref_none("TweakDBID", "uint64", "0"),
-    "journalEntryOverrideDataList": [],
-    "locationPrefabRef": ref_none("NodeRef", "uint64", "0"),
-    "optional": 0,
     }}
+
+scene_objectives = []   # (id, text)
+for d in sorted(by_district):
+    scene_objectives.append(("scene_" + d, q["scene_objective"].replace("{District}", districts[d])))
+
 quest = {"HandleId": h(), "Data": {
     "$type": "gameJournalQuest",
     "districtID": "",
@@ -160,7 +181,9 @@ quest = {"HandleId": h(), "Data": {
         }},
         {"HandleId": h(), "Data": {
             "$type": "gameJournalQuestPhase",
-            "entries": [make_objective(oid) for oid, _ in objectives],
+            "entries": [empty_objective(oid) for oid, _ in objectives]
+                     + [empty_objective(oid, [site_pin(st) for st in by_district[oid[6:]]])
+                        for oid, _ in scene_objectives],
             "id": "call",
             "journalEntryOverrideDataList": [],
             "locationPrefabRef": ref_none("NodeRef", "uint64", "0"),
@@ -206,7 +229,8 @@ journal = {
 
 texts = ([("conv_title", spec["conversation_title"]),
           ("quest_title", q["title"]), ("quest_description", q["description"])]
-         + [("quest_obj_" + oid, t) for oid, t in objectives]
+         + [("quest_obj_" + oid, t) for oid, t in objectives + scene_objectives]
+         + [("pin_" + d, q["pin_caption"].replace("{District}", districts[d])) for d in sorted(by_district)]
          + [("reply_" + c["id"], c["text"]) for c in (replies or {}).get("choices", [])]
          + [("msg_" + m["id"], m["text"]) for m in spec["messages"]])
 keys = [k for k, _ in texts]
@@ -230,4 +254,5 @@ os.makedirs(os.path.join(base, "journal"), exist_ok=True)
 os.makedirs(os.path.join(base, "localization"), exist_ok=True)
 json.dump(journal, open(os.path.join(base, "journal", "ncpd_dispatch.journal.json"), "w"), indent=1)
 json.dump(locres, open(os.path.join(base, "localization", "en-us.json.json"), "w"), indent=1)
-print(f"{len(spec['messages'])} messages, {len(objectives)} objectives, {len(texts)} texts")
+print(f"{len(spec['messages'])} messages, {len(objectives)} call objectives, "
+      f"{len(scene_objectives)} scene objectives, {len(sites_spec['sites'])} site pins, {len(texts)} texts")

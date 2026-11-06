@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.7.1",
+    version = "0.8.0",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -478,7 +478,16 @@ local function writeSpots()
 end
 
 local BANNED_FILE = "ncpd_spots_banned.json"
-NCPD.banned = NCPD.banned or {}   -- cellKey -> true: spots that turned out unreachable
+NCPD.banned = NCPD.banned or {}         -- cellKey -> true: learned spots that turned out unreachable
+NCPD.bannedSites = NCPD.bannedSites or {}   -- site id -> true: call sites with no walking route
+
+local function writeBanned()
+    local cells, sites = {}, {}
+    for k in pairs(NCPD.banned) do table.insert(cells, k) end
+    for k in pairs(NCPD.bannedSites) do table.insert(sites, k) end
+    local f = io.open(BANNED_FILE, "w")
+    if f then f:write(json.encode({ cells = cells, sites = sites })); f:close() end
+end
 
 local function addSpot(p)
     local k = cellKey(p.x, p.y)
@@ -500,10 +509,7 @@ local function banSpot(p, why)
     end
     NCPD.spots = kept
     NCPD.spotCells[k] = nil
-    local keys = {}
-    for b in pairs(NCPD.banned) do table.insert(keys, b) end
-    local f = io.open(BANNED_FILE, "w")
-    if f then f:write(json.encode(keys)); f:close() end
+    writeBanned()
     NCPD.spotsDirty = NCPD.spotsDirty + 1
     writeSpots()
     log(("spot %.0f %.0f banned (%s), %d removed, %d spots left"):format(p.x, p.y, why, removed, #NCPD.spots))
@@ -512,9 +518,14 @@ end
 local function loadSpots()
     local bf = io.open(BANNED_FILE, "r")
     if bf then
-        local ok, keys = pcall(json.decode, bf:read("*a"))
+        local ok, data = pcall(json.decode, bf:read("*a"))
         bf:close()
-        if ok and type(keys) == "table" then for _, k in ipairs(keys) do NCPD.banned[k] = true end end
+        if ok and type(data) == "table" then
+            -- v0.7.1 wrote a plain list of cells
+            local cells = data.cells or (data[1] and data) or {}
+            for _, k in ipairs(cells) do NCPD.banned[k] = true end
+            for _, k in ipairs(data.sites or {}) do NCPD.bannedSites[k] = true end
+        end
     end
     local f = io.open(SPOTS_FILE, "r")
     if not f then return end
@@ -588,6 +599,130 @@ local function pickTarget()
     return Vector4.new(o.x + math.cos(a) * d, o.y + math.sin(a) * d, o.z, 1), "rough", veh
 end
 
+---------------------------------------------------------------- call sites
+
+-- The game's own NCPD "Assault in Progress" sites (sites.json, installed next
+-- to init.lua; the archive has a quest pin for each). Calls go to these;
+-- learned spots are only the fallback when no site is in range.
+local SITES_FILE = "sites.json"
+NCPD.sites = {}          -- { id, poi, district, x, y, z }
+NCPD.districtName = {}   -- "wat_kab" -> "Kabuki"
+NCPD.spentSites = {}     -- this session: pin didn't come back, or call abandoned/late there
+NCPD.usedSites = {}      -- this session: pin was shown once
+
+local function loadSites()
+    local f = io.open(SITES_FILE, "r")
+    if not f then log("sites.json missing: calls use learned spots and a plain map pin"); return end
+    local ok, data = pcall(json.decode, f:read("*a"))
+    f:close()
+    if not ok or type(data) ~= "table" or type(data.sites) ~= "table" then
+        log("sites.json unreadable: calls use learned spots"); return
+    end
+    NCPD.sites = data.sites
+    NCPD.districtName = data.districts or {}
+end
+
+local STATE_NAMES = { "Undefined", "Inactive", "Active", "Succeeded", "Failed" }
+local function stateName(v)
+    for _, n in ipairs(STATE_NAMES) do
+        local ok, e = pcall(function() return EnumInt(gameJournalEntryState[n]) end)
+        if ok and e == v then return n end
+    end
+    return tostring(v)
+end
+
+-- State of the vanilla NCPD activity at a site, from its map icon's journal
+-- entry. Assumed: Succeeded = cleared (first runs log the spread to confirm).
+local function siteState(site)
+    local ok, v = pcall(function()
+        local jm = Game.GetJournalManager()
+        return EnumInt(jm:GetEntryState(jm:GetEntryByString(site.poi, "gameJournalPointOfInterestMappin")))
+    end)
+    return ok and stateName(v) or "unknown"
+end
+local function siteCleared(site) return siteState(site) == "Succeeded" end
+
+local function logSiteStates()
+    if NCPD.siteStatesLogged or #NCPD.sites == 0 then return end
+    NCPD.siteStatesLogged = true
+    local count = {}
+    for _, st in ipairs(NCPD.sites) do
+        local n = siteState(st)
+        count[n] = (count[n] or 0) + 1
+    end
+    local parts = {}
+    for n, k in pairs(count) do table.insert(parts, n .. " " .. k) end
+    local banned = 0
+    for _ in pairs(NCPD.bannedSites) do banned = banned + 1 end
+    log(("%d call sites, vanilla NCPD states: %s; banned %d"):format(#NCPD.sites, table.concat(parts, ", "), banned))
+end
+
+local function isRecent(x, y)
+    for _, r in ipairs(NCPD.recent) do
+        local dx, dy = x - r.x, y - r.y
+        if dx * dx + dy * dy < RECENT_RADIUS * RECENT_RADIUS then return true end
+    end
+    return false
+end
+
+-- A site in the distance band, cleared ones first; else the nearest usable
+-- site within 1500 m; else nil (learned-spot fallback).
+local function pickSite()
+    local o = Game.GetPlayer():GetWorldPosition()
+    local veh = inVehicle()
+    local lo, hi = 150, 600
+    if veh then lo, hi = 400, 1500 end
+    local cleared, other, nearest, nd = {}, {}, nil, nil
+    for _, st in ipairs(NCPD.sites) do
+        if not NCPD.bannedSites[st.id] and not NCPD.spentSites[st.id] and not isRecent(st.x, st.y) then
+            local d = math.sqrt((st.x - o.x) ^ 2 + (st.y - o.y) ^ 2)
+            if d >= lo and d <= hi then
+                table.insert(siteCleared(st) and cleared or other, st)
+            elseif d >= 100 and d <= 1500 and (not nd or d < nd) then
+                nearest, nd = st, d
+            end
+        end
+    end
+    if #cleared > 0 then return cleared[math.random(#cleared)], veh, "cleared site" end
+    if #other > 0 then return other[math.random(#other)], veh, "uncleared site" end
+    if nearest then return nearest, veh, "nearest site" end
+    return nil, veh
+end
+
+-- Gangs that run each district; 15 % of calls ignore the list.
+local DISTRICT_GANGS = {
+    wat_kab = { "Tyger Claws", "Maelstrom", "Scavengers" },
+    wat_lch = { "Tyger Claws", "Maelstrom", "Scavengers" },
+    wat_nid = { "Maelstrom", "Scavengers", "Tyger Claws" },
+    wbr_jpn = { "Tyger Claws", "Valentinos" },
+    wbr_hil = { "Tyger Claws", "Valentinos" },
+    wbr_nok = { "Tyger Claws", "Valentinos" },
+    hey_gle = { "Valentinos", "6th Street" },
+    hey_rey = { "Valentinos", "6th Street" },
+    hey_spr = { "Valentinos", "6th Street" },
+    std_arr = { "6th Street", "Valentinos", "Scavengers", "Maelstrom" },
+    std_rcr = { "6th Street", "Valentinos", "Scavengers", "Maelstrom" },
+    pac_cvi = { "Animals", "Voodoo Boys" },
+    pac_wwd = { "Animals", "Voodoo Boys" },
+    cct_cpz = { "Maelstrom", "Tyger Claws", "Animals" },
+    cct_dtn = { "Maelstrom", "Tyger Claws", "Animals" },
+    bls_ina = { "Wraiths", "6th Street" },
+}
+local DISTRICT_ANY = 15
+
+local function pickGang(district, exclude)
+    local function usable(name) return name ~= exclude and #(NCPD.pools[name] or {}) > 0 end
+    local list = {}
+    if district and DISTRICT_GANGS[district] and math.random(100) > DISTRICT_ANY then
+        for _, n in ipairs(DISTRICT_GANGS[district]) do if usable(n) then table.insert(list, n) end end
+    end
+    if #list == 0 then
+        for _, f in ipairs(FACTIONS) do if usable(f.name) then table.insert(list, f.name) end end
+    end
+    if #list == 0 then return nil end
+    return list[math.random(#list)]
+end
+
 ---------------------------------------------------------------- GPS objective
 
 -- A Contract quest "NCPD Dispatch" with one objective and a GPS map pin is
@@ -606,102 +741,121 @@ local function jstate(path, cls, state, notify)
 end
 
 -- The archive has one objective per call type and gang (gang wars per gang
--- pair) so the objective line names the call: respond_<type>_<gang>[_<rival>].
+-- pair) that names the call, respond_<type>_<gang>[_<rival>], without a pin;
+-- and one objective per district, scene_<district> ("Get to the scene:
+-- Kabuki"), holding a map pin per call site, site_<id>. A pin's position is
+-- fixed in the archive (it can't be moved at runtime), so calls go to those
+-- sites. The tracker lists both active objectives; the scene one is tracked
+-- for GPS and distance.
 local function objPath(c)
     local id = "respond_" .. c.type.key .. "_" .. (GANG_SLUG[c.faction] or "")
     if c.faction2 then id = id .. "_" .. (GANG_SLUG[c.faction2] or "") end
     return PHASE .. "/" .. id
 end
 
+local PIN_CLASS = "gameJournalQuestMapPin"
+
 -- Turns the quest off. With no call, every objective is switched off (after
--- a load we don't know which one a saved game left active).
+-- a load we don't know which ones a saved game left active).
 local function questOff(c)
     local Q = JournalNotifyOption.DoNotNotify
+    local off = gameJournalEntryState.Inactive
     if c and c.obj then
-        jstate(c.obj .. "/call_mappin", "gameJournalQuestMapPin", gameJournalEntryState.Inactive, Q)
-        jstate(c.obj, OBJ_CLASS, gameJournalEntryState.Inactive, Q)
+        if c.pinPath then jstate(c.pinPath, PIN_CLASS, off, Q) end
+        if c.sceneObj then jstate(c.sceneObj, OBJ_CLASS, off, Q) end
+        jstate(c.obj, OBJ_CLASS, off, Q)
     else
         for _, t in ipairs(CALL_TYPES) do
             for _, a in pairs(GANG_SLUG) do
                 if t.war then
                     for _, b in pairs(GANG_SLUG) do
-                        if a ~= b then jstate(PHASE .. "/respond_war_" .. a .. "_" .. b, OBJ_CLASS, gameJournalEntryState.Inactive, Q) end
+                        if a ~= b then jstate(PHASE .. "/respond_war_" .. a .. "_" .. b, OBJ_CLASS, off, Q) end
                     end
                 else
-                    jstate(PHASE .. "/respond_" .. t.key .. "_" .. a, OBJ_CLASS, gameJournalEntryState.Inactive, Q)
+                    jstate(PHASE .. "/respond_" .. t.key .. "_" .. a, OBJ_CLASS, off, Q)
                 end
             end
         end
+        for d in pairs(NCPD.districtName) do jstate(PHASE .. "/scene_" .. d, OBJ_CLASS, off, Q) end
     end
-    jstate(PHASE, "gameJournalQuestPhase", gameJournalEntryState.Inactive, Q)
-    jstate(QUEST, "gameJournalQuest", gameJournalEntryState.Inactive, Q)
+    jstate(PHASE, "gameJournalQuestPhase", off, Q)
+    jstate(QUEST, "gameJournalQuest", off, Q)
 end
 
 local function questStart(c)
     if not NCPD.save.gpsQuest then return end
     c.obj = objPath(c)
+    if c.site then
+        c.sceneObj = PHASE .. "/scene_" .. c.site.district
+        c.pinPath = c.sceneObj .. "/site_" .. c.site.id
+    end
     questOff(c)
-    local Q = JournalNotifyOption.DoNotNotify
-    local okQ = jstate(QUEST, "gameJournalQuest", gameJournalEntryState.Active, Q)
-    local okP = jstate(PHASE, "gameJournalQuestPhase", gameJournalEntryState.Active, Q)
-    local okO = jstate(c.obj, OBJ_CLASS, gameJournalEntryState.Active, JournalNotifyOption.Notify)
-    -- the pin is its own journal entry; an Inactive pin is never spawned
-    local okM = jstate(c.obj .. "/call_mappin", "gameJournalQuestMapPin", gameJournalEntryState.Active, Q)
+    local Q, on = JournalNotifyOption.DoNotNotify, gameJournalEntryState.Active
+    local okQ = jstate(QUEST, "gameJournalQuest", on, Q)
+    local okP = jstate(PHASE, "gameJournalQuestPhase", on, Q)
+    local okO = jstate(c.obj, OBJ_CLASS, on, JournalNotifyOption.Notify)
+    local okS, okM = "-", "-"
+    if c.sceneObj then
+        okS = tostring(jstate(c.sceneObj, OBJ_CLASS, on, Q))
+        -- the pin is its own journal entry; an Inactive pin is never spawned
+        okM = tostring(jstate(c.pinPath, PIN_CLASS, on, Q))
+    end
+    local trackPath = c.sceneObj or c.obj
     local tracked = pcall(function()
         local jm = Game.GetJournalManager()
-        jm:TrackEntry(jm:GetEntryByString(c.obj, OBJ_CLASS))
+        jm:TrackEntry(jm:GetEntryByString(trackPath, OBJ_CLASS))
     end)
     c.questOn = true
     c.pinTries = 0
-    log(("GPS objective %s: quest %s, phase %s, objective %s, pin %s, tracked %s"):format(
-        c.obj:match("[^/]+$"), tostring(okQ), tostring(okP), tostring(okO), tostring(okM), tostring(tracked)))
+    log(("GPS objective %s: quest %s, phase %s, objective %s, scene %s, pin %s, tracked %s"):format(
+        c.obj:match("[^/]+$"), tostring(okQ), tostring(okP), tostring(okO), okS, okM, tostring(tracked)))
 end
 
--- Find the objective's map pin (it registers a moment after activation)
--- and keep it on the call's current position.
+-- Find the site's quest pin (it registers a moment after activation). It
+-- normally shows up on the first check; if it doesn't within ~3 s (e.g. a
+-- site re-used in the same session doesn't re-register), the plain pin stays
+-- and the site isn't offered again this session.
 local function questPin(c)
-    if not c.questOn or c.pinFailed then return end
+    if not c.questOn or not c.sceneObj or c.pinFailed or c.questPin then return end
+    c.pinTries = c.pinTries + 1
+    pcall(function()
+        local jm = Game.GetJournalManager()
+        local ph = jm:GetEntryByString(PHASE, "gameJournalQuestPhase")
+        local ob = jm:GetEntryByString(c.sceneObj, OBJ_CLASS)
+        local m = Game.GetMappinSystem():GetMappinFromObjective(ph, ob)
+        if m then c.questPin = m:GetNewMappinID() end
+    end)
     if not c.questPin then
-        c.pinTries = c.pinTries + 1
-        pcall(function()
-            local jm = Game.GetJournalManager()
-            local ph = jm:GetEntryByString(PHASE, "gameJournalQuestPhase")
-            local ob = jm:GetEntryByString(c.obj, OBJ_CLASS)
-            local m = Game.GetMappinSystem():GetMappinFromObjective(ph, ob)
-            if m then c.questPin = m:GetNewMappinID() end
-        end)
-        if not c.questPin then
-            if c.pinTries >= 40 then   -- ~10 s at 4 checks a second
-                c.pinFailed = true
-                log("GPS objective pin not found; using a plain map pin")
-            end
-            return
+        if c.pinTries >= 12 then
+            c.pinFailed = true
+            NCPD.spentSites[c.site.id] = true
+            log(("GPS pin for site %s not found (used before this session: %s); plain map pin instead"):format(
+                c.site.id, tostring(NCPD.usedSites[c.site.id] or false)))
         end
-        log(("GPS objective pin found after %d checks"):format(c.pinTries))
-        if NCPD.save.ncpdIcon then
-            local ok = pcall(function()
-                Game.GetMappinSystem():ChangeMappinVariant(c.questPin, gamedataMappinVariant.Zzz06_NCPDGigVariant)
-            end)
-            log("NCPD icon " .. (ok and "set" or "failed"))
-        end
-        -- the plain pin is no longer needed
-        if c.mappin then
-            pcall(function() Game.GetMappinSystem():UnregisterMappin(c.mappin) end)
-            c.mappin = nil
-        end
+        return
     end
-    if c.markPos and c.pinAt ~= c.markPos then
-        local ok = pcall(function() Game.GetMappinSystem():SetMappinPosition(c.questPin, c.markPos) end)
-        c.pinAt = c.markPos
-        if not ok then log("could not move GPS pin") end
+    log(("GPS pin for site %s found after %d checks%s"):format(c.site.id, c.pinTries,
+        NCPD.usedSites[c.site.id] and " (re-used site)" or ""))
+    NCPD.usedSites[c.site.id] = true
+    if NCPD.save.ncpdIcon then
+        local ok = pcall(function()
+            Game.GetMappinSystem():ChangeMappinVariant(c.questPin, gamedataMappinVariant.Zzz06_NCPDGigVariant)
+        end)
+        log("NCPD icon " .. (ok and "set" or "failed"))
+    end
+    -- the plain pin is no longer needed while the call is at the site
+    if c.mappin and c.state == "enroute" then
+        pcall(function() Game.GetMappinSystem():UnregisterMappin(c.mappin) end)
+        c.mappin = nil
     end
 end
 
 local function questEnd(c, outcome)
     if not c or not c.questOn then return end
     local Q = JournalNotifyOption.DoNotNotify
-    jstate(c.obj, OBJ_CLASS,
-        outcome == "cleared" and gameJournalEntryState.Succeeded or gameJournalEntryState.Failed, Q)
+    local final = outcome == "cleared" and gameJournalEntryState.Succeeded or gameJournalEntryState.Failed
+    jstate(c.obj, OBJ_CLASS, final, Q)
+    if c.sceneObj then jstate(c.sceneObj, OBJ_CLASS, final, Q) end
     pcall(function() Game.GetJournalManager():UntrackEntry() end)
     -- switching the objective off leaves its registered pin on the map, so
     -- take the pin off directly
@@ -842,8 +996,12 @@ local function endCall(outcome)
     end
     -- learn spots from scenes that worked; forget targets V gave up on
     if outcome == "cleared" and c.pos then addSpot(c.pos)
-    elseif (outcome == "abandoned" or outcome == "late") and (c.targetHow or ""):match("^learned") then
-        banSpot(c.target, outcome)
+    elseif outcome == "abandoned" or outcome == "late" then
+        if c.site then
+            NCPD.spentSites[c.site.id] = true   -- not again this session
+        elseif (c.targetHow or ""):match("^learned") then
+            banSpot(c.target, outcome)
+        end
     end
     restorePolice(outcome)
     questEnd(c, outcome)
@@ -856,10 +1014,19 @@ end
 -- Choose what the call is about and where, without spawning anything yet.
 local function prepareCall()
     if not NCPD.poolsBuilt then buildPools() end
-    local faction = pickFaction()
+    logSiteStates()
+    -- the place first: its district decides the gang
+    local site, veh, siteHow = pickSite()
+    local target, how
+    if site then
+        target, how = Vector4.new(site.x, site.y, site.z, 1), "site"
+    else
+        target, how, veh = pickTarget()
+    end
+    local faction = pickGang(site and site.district)
     if not faction then log("no usable gang NPC records found; cannot dispatch"); return nil end
     local s = NCPD.save
-    -- a rival gang for gang wars
+    -- a rival gang for gang wars (same district list when possible)
     local rivals = {}
     for _, f in ipairs(FACTIONS) do
         if f.name ~= faction and #NCPD.pools[f.name] > 0 then table.insert(rivals, f.name) end
@@ -871,9 +1038,10 @@ local function prepareCall()
         if ok then table.insert(choices, t) end
     end
     local ctype = choices[math.random(#choices)]
-    local prep = { type = ctype, faction = faction, count = math.random(ctype.min, ctype.max) }
+    local prep = { type = ctype, faction = faction, count = math.random(ctype.min, ctype.max),
+        site = site, siteHow = siteHow, target = target, how = how, veh = veh }
     if ctype.war then
-        prep.faction2 = rivals[math.random(#rivals)]
+        prep.faction2 = pickGang(site and site.district, faction) or rivals[math.random(#rivals)]
         prep.count2 = math.random(ctype.min, ctype.max)
     elseif s.bossEnabled and s.rep >= BOSS_MIN_REP and #(NCPD.bossPools[faction] or {}) > 0
         and math.random(100) <= s.bossChance then
@@ -891,7 +1059,12 @@ end
 
 local function setMappin(c, pos)
     c.markPos = pos
-    if c.questPin then questPin(c); return end
+    -- the site's quest pin can't move: only add a plain pin if the scene
+    -- ended up away from it
+    if c.questPin and c.site and math.sqrt((pos.x - c.site.x) ^ 2 + (pos.y - c.site.y) ^ 2) <= 30 then
+        if c.mappin then pcall(function() Game.GetMappinSystem():UnregisterMappin(c.mappin) end); c.mappin = nil end
+        return
+    end
     if c.mappin then pcall(function() Game.GetMappinSystem():UnregisterMappin(c.mappin) end) end
     c.mappin = nil
     pcall(function()
@@ -906,13 +1079,13 @@ end
 
 -- Answering a call only sets a destination; suspects spawn when V is close.
 local function dispatchCall(prep)
-    local target, how, veh = pickTarget()
+    local target, how, veh = prep.target, prep.how, prep.veh
     local dist = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), target)
     local c = {
         type = prep.type, faction = prep.faction, count = prep.count,
         faction2 = prep.faction2, count2 = prep.count2, boss = prep.boss, backup = prep.backup,
         allies = {}, victims = {}, victimCount = prep.victims or 0,
-        state = "enroute", target = target, targetHow = how, pos = target,
+        state = "enroute", target = target, targetHow = how, pos = target, site = prep.site,
         suspects = {}, nonlethal = 0, fled = 0, civDead = false,
         started = NCPD.now, deadline = NCPD.now + 120 + dist / 6,
     }
@@ -921,15 +1094,28 @@ local function dispatchCall(prep)
     NCPD.call = c
     table.insert(NCPD.recent, { x = target.x, y = target.y })
     while #NCPD.recent > RECENT_KEEP do table.remove(NCPD.recent, 1) end
-    log(("call dispatched: %s, %s x%d%s, %.0f m away (%s target, %s)%s%s"):format(
+    local where = c.site and ("%s site %s, %s"):format(prep.siteHow, c.site.id, NCPD.districtName[c.site.district] or c.site.district)
+        or (how .. " target")
+    log(("call dispatched: %s, %s x%d%s, %.0f m away (%s, %s)%s%s"):format(
         c.type.title, c.faction, c.count,
         c.faction2 and (" vs " .. c.faction2 .. " x" .. c.count2) or "",
-        dist, how, veh and "in vehicle" or "on foot",
+        dist, where, veh and "in vehicle" or "on foot",
         c.boss and " [heavy planned]" or "", c.backup and (" [backup x" .. c.backup .. "]") or ""))
     return target
 end
 
 -- Find walkable ground at the destination now that its navmesh is loaded.
+-- An unreachable call site is banned for good; a learned spot's cell too.
+local function banTarget(c, why)
+    if c.site then
+        NCPD.bannedSites[c.site.id] = true
+        writeBanned()
+        log(("site %s banned (%s)"):format(c.site.id, why))
+    elseif (c.targetHow or ""):match("^learned") then
+        banSpot(c.target, why)
+    end
+end
+
 -- Walking route check. Only meaningful near V, where the navmesh is
 -- streamed in (the scene is placed at 150 m). Returns true / false, or nil
 -- when the query itself isn't available (then nothing is rejected).
@@ -967,7 +1153,8 @@ end
 -- then to a spot near V; an unreachable learned target is banned.
 local function sceneCentre(c)
     local nav = navSystem()
-    local ref = (c.targetHow or ""):match("^learned") and c.target.z or Game.GetPlayer():GetWorldPosition().z
+    local trusted = c.targetHow == "site" or (c.targetHow or ""):match("^learned")
+    local ref = trusted and c.target.z or Game.GetPlayer():GetWorldPosition().z
     local start = nav and navStart()
     local reasons, checked = {}, start ~= nil
     if nav and not start then log("path check skipped: no navmesh under V") end
@@ -1007,7 +1194,7 @@ local function sceneCentre(c)
                 end)
                 if ok and sp and (sp.x ~= 0 or sp.y ~= 0) and reachable(sp) then
                     log(("target unreachable (%s); moved %.0f m to a learned spot"):format(table.concat(reasons, "; "), near[i].d))
-                    if (c.targetHow or ""):match("^learned") then banSpot(c.target, "no walking route") end
+                    banTarget(c, "no walking route")
                     return sp, "nearby spot, " .. c.pathInfo
                 end
             end
@@ -1015,7 +1202,7 @@ local function sceneCentre(c)
     end
     if checked then
         log("target unreachable: " .. table.concat(reasons, "; "))
-        if (c.targetHow or ""):match("^learned") then banSpot(c.target, "no walking route") end
+        banTarget(c, "no walking route")
     end
     local p, how = pickScene()   -- last resort: a spot near V
     return p, "near V (" .. how .. ")"
@@ -1158,6 +1345,7 @@ local function answerCall()
         text(prep.type.key .. "_" .. slug)
     end
     local what = prep.faction2 and (prep.faction .. " vs " .. prep.faction2) or prep.faction
+    if prep.site then what = what .. " in " .. (NCPD.districtName[prep.site.district] or prep.site.district) end
     say("NCPD DISPATCH", ("%s, %s.\nCan you take it? %s"):format(prep.type.title, what,
         phone and "Reply by text or use your NCPD keys." or "Use your NCPD answer / decline keys."), OFFER_TIMEOUT)
     log("call offered: " .. prep.type.title .. " / " .. what)
@@ -1496,7 +1684,8 @@ registerForEvent("onInit", function()
     math.randomseed(os.time())
     loadSave()
     loadSpots()
-    log(("%d learned street spots."):format(#NCPD.spots))
+    loadSites()
+    log(("%d learned street spots, %d call sites."):format(#NCPD.spots, #NCPD.sites))
     log(("v%s loaded. Rank %s, rep %d, on duty: %s."):format(NCPD.version, rankName(), NCPD.save.rep, tostring(NCPD.save.onDuty)))
 end)
 
@@ -1642,6 +1831,10 @@ registerForEvent("onDraw", function()
             local c, left = NCPD.call, 0
             for _, x in ipairs(c.suspects) do if not x.done then left = left + 1 end end
             ImGui.Text(("Active: %s (%s)"):format(c.type.title, c.faction))
+            if c.site then
+                ImGui.Text(("Site: %s, %s (%s)"):format(c.site.id, NCPD.districtName[c.site.district] or c.site.district,
+                    siteCleared(c.site) and "cleared" or "uncleared"))
+            end
             if c.state == "enroute" then
                 local d = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.target)
                 ImGui.Text(("En route: %.0f m, %d s left"):format(d, math.max(0, math.floor(c.deadline - NCPD.now))))

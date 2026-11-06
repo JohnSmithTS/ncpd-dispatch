@@ -7,15 +7,6 @@
     "id": "ncpd_dispatch_call",
     "type": "Contract",
     "variant": "DefaultQuestVariant",
-    "anchor": {
-      "node": "#coyote_performance_test",
-      "pos": [
-        -1259.71252,
-        -988.872009,
-        12.037246
-      ],
-      "note": "El Coyote Cojo; always-loaded base-game node (position from andreaolivato/cyberpunk-codes find_pin_anchors, game 2.31)"
-    },
     "title": "NCPD Dispatch",
     "description": "Dispatch has a crime in progress for you. Get to the scene, deal with the suspects and keep the civilians alive.",
     "objectives": {
@@ -23,7 +14,9 @@
       "assault": "Respond: gang assault, {Gang}",
       "shots": "Respond: shots fired, {Gang}",
       "war": "Respond: gang war, {Gang} vs {Rival}"
-    }
+    },
+    "scene_objective": "Get to the scene: {District}",
+    "pin_caption": "NCPD call: {District}"
   },
   "gangs": {
     "maelstrom": "Maelstrom",
