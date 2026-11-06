@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.8.2",
+    version = "0.8.3",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -1156,8 +1156,18 @@ local function sceneCentre(c)
     local start = nav and navStart()
     local reasons, checked = {}, start ~= nil
     if nav and not start then log("path check skipped: no navmesh under V") end
+    -- Call sites are the game's own street-fight areas, so they're reachable;
+    -- the route query gives false "no path" at this range (2 of 2 good sites
+    -- in one test), so for sites it's only logged, never acted on.
+    local advisory = c.site ~= nil
+    if advisory then checked = false end
     local function reachable(sp)
         if not start then return true end
+        if advisory then
+            local ok, info = walkPath(start, sp)
+            c.pathInfo = (ok and "" or "unconfirmed: ") .. tostring(info)
+            return true
+        end
         local ok, info = walkPath(start, sp)
         if ok == nil then
             log("path check unavailable: " .. info); start = nil; checked = false
@@ -1174,7 +1184,7 @@ local function sceneCentre(c)
             local p = Vector4.new(c.target.x + math.cos(ang) * r, c.target.y + math.sin(ang) * r, ref + 4, 1)
             local ok, sp = pcall(function() return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, 3.0, 8) end)
             if ok and sp and (sp.x ~= 0 or sp.y ~= 0) and math.abs(sp.z - ref) < 6 and reachable(sp) then
-                return sp, "at target" .. (checked and (", " .. c.pathInfo) or "")
+                return sp, "at target" .. ((checked or advisory) and c.pathInfo and (", " .. c.pathInfo) or "")
             end
         end
         if checked and not c.site then
@@ -1205,6 +1215,10 @@ local function sceneCentre(c)
         log("target unreachable: " .. table.concat(reasons, "; "))
         banTarget(c, "no walking route")
         return nil, "unreachable"
+    end
+    if c.site then
+        -- no navmesh found at the site: use the site point itself
+        return Vector4.new(c.site.x, c.site.y, c.site.z, 1), "site point (no navmesh found)"
     end
     local p, how = pickScene()   -- no route check available: a spot near V
     return p, "near V (" .. how .. ")"
