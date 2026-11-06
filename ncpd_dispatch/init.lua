@@ -2,10 +2,11 @@
 -- v0.2: dispatch calls arrive by phone (ring, caller-ID panel, dispatcher
 -- lines); on-duty toggle and settings remembered; generated "crime in progress" calls built
 -- from the game's own gang NPC records, map marker, payout, reputation, ranks.
+-- v0.4: surprise heavies, gang wars between two factions, NCPD backup.
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.3.0",
+    version = "0.4.0",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -15,6 +16,8 @@ local NCPD = {
     dialog = nil,               -- dispatcher lines being shown
     panel = nil,                -- HUD widgets for the phone panel
     pools = {},                 -- faction name -> list of record id strings
+    bossPools = {},             -- faction name -> tougher (Elite/Officer) records
+    copPool = {},               -- NCPD officer records for backup
     poolsBuilt = false,
     lastLog = "",
     save = {
@@ -24,12 +27,21 @@ local NCPD = {
         autoDispatch = true,
         autoAnswer = true,
         dispatchEvery = 240,    -- seconds between calls while on duty
+        bossEnabled = true,     -- surprise heavy can join an ordinary call
+        bossChance = 15,        -- percent per eligible call
+        gangWarEnabled = true,  -- two rival gangs fighting each other
+        backupEnabled = true,   -- friendly NCPD officers on big calls
     },
 }
 
 local RING_AUTO_ANSWER = 4      -- seconds of ringing before auto-answer
 local RING_TIMEOUT = 20         -- seconds before an unanswered call is missed
 local MISSED_RETRY = 90         -- seconds until dispatch tries again
+local BOSS_MIN_REP = 30         -- rep needed before heavies can show up
+local BACKUP_MIN_REP = 150      -- Sergeant and up get NCPD backup
+local BOSS_PAY, BOSS_REP = 2500, 20
+local BOSS_GRACE = 180          -- seconds of no progress before a heavy "flees"
+local WAR_EARLY_BONUS = 0.25    -- extra pay for reaching a gang war mid-fight
 
 local SAVE_FILE = "ncpd_save.json"
 
@@ -48,11 +60,17 @@ local OK_RARITY = {
     ["NPCRarity.Trash"] = true, ["NPCRarity.Weak"] = true,
     ["NPCRarity.Normal"] = true, ["NPCRarity.Rare"] = true,
 }
+local BOSS_RARITY = {
+    ["NPCRarity.Elite"] = true, ["NPCRarity.Officer"] = true, ["NPCRarity.Boss"] = true,
+}
+local NCPD_FACTION_IDS = { ["Factions.NCPD"] = true }
 
 local CALL_TYPES = {
     { title = "Armed robbery in progress", min = 2, max = 3, pay = 1200, rep = 10 },
     { title = "Gang assault in progress",  min = 3, max = 4, pay = 1800, rep = 15 },
     { title = "Shots fired, multiple suspects", min = 4, max = 6, pay = 2600, rep = 25, minRep = 60 },
+    -- min/max are per side; pay is a base plus perSuspect for each one down
+    { title = "Gang war in progress", war = true, min = 3, max = 4, pay = 1500, perSuspect = 350, rep = 30, minRep = 100 },
 }
 
 local RANKS = {
@@ -234,9 +252,9 @@ end
 -- Build per-gang pools from TweakDB instead of hard-coding record names, so
 -- calls use whatever regular gang members the game actually has.
 local function buildPools()
-    NCPD.pools = {}
+    NCPD.pools, NCPD.bossPools, NCPD.copPool = {}, {}, {}
     local want = {}
-    for _, f in ipairs(FACTIONS) do want[f.id] = f.name; NCPD.pools[f.name] = {} end
+    for _, f in ipairs(FACTIONS) do want[f.id] = f.name; NCPD.pools[f.name] = {}; NCPD.bossPools[f.name] = {} end
 
     local records = TweakDB:GetRecords("gamedataCharacter_Record") or {}
     local total = 0
@@ -246,14 +264,27 @@ local function buildPools()
             if id == "" or not id:find("^Character%.") then return end
             -- skip quest / unique characters
             local low = id:lower()
-            if low:find("^character%.[ms]?q%d") or low:find("quest") or low:find("boss")
+            if low:find("^character%.[ms]?q%d") or low:find("quest")
                 or low:find("unique") or low:find("dummy") or low:find("test") then return end
             local aff = rec:Affiliation()
             if not aff then return end
-            local faction = want[idStr(aff:GetID())]
-            if not faction then return end
+            local affId = idStr(aff:GetID())
             local rar = rec:Rarity()
-            if not rar or not OK_RARITY[idStr(rar:GetID())] then return end
+            local rarId = rar and idStr(rar:GetID()) or ""
+            if NCPD_FACTION_IDS[affId] then
+                if (OK_RARITY[rarId] or rarId == "NPCRarity.Officer") and not low:find("boss")
+                    and not low:find("maxtac") then
+                    table.insert(NCPD.copPool, id)
+                end
+                return
+            end
+            local faction = want[affId]
+            if not faction then return end
+            if BOSS_RARITY[rarId] then
+                table.insert(NCPD.bossPools[faction], id)
+                return
+            end
+            if low:find("boss") or not OK_RARITY[rarId] then return end
             table.insert(NCPD.pools[faction], id)
             total = total + 1
         end)
@@ -261,6 +292,9 @@ local function buildPools()
     local parts = {}
     for _, f in ipairs(FACTIONS) do table.insert(parts, f.name .. "=" .. #NCPD.pools[f.name]) end
     log(("NPC pools built from %d records: %d usable (%s)"):format(#records, total, table.concat(parts, ", ")))
+    local bparts = {}
+    for _, f in ipairs(FACTIONS) do table.insert(bparts, f.name .. "=" .. #NCPD.bossPools[f.name]) end
+    log(("heavy pools (Elite/Officer/Boss): %s; NCPD officers: %d"):format(table.concat(bparts, ", "), #NCPD.copPool))
     NCPD.poolsBuilt = total > 0
 end
 
@@ -429,8 +463,17 @@ local function endCall(outcome)
     clearMappin()
     if outcome == "cleared" then
         local caught = #c.suspects - c.fled
-        local pay = c.type.pay + 300 * caught
+        local pay = c.type.pay + (c.type.perSuspect or 300) * caught
         local rep = c.type.rep
+        local notes = {}
+        if c.warEarly then
+            pay = math.floor(pay * (1 + WAR_EARLY_BONUS)); rep = rep + 10
+            table.insert(notes, " Caught them mid-fight.")
+        end
+        if c.bossDown then
+            pay = pay + BOSS_PAY; rep = rep + BOSS_REP
+            table.insert(notes, " Heavy neutralized.")
+        end
         if c.fled > 0 then pay = math.floor(pay * 0.75); rep = math.floor(rep / 2) end
         local allAlive = c.fled == 0 and c.nonlethal == #c.suspects
         if allAlive then
@@ -446,9 +489,11 @@ local function endCall(outcome)
         writeSave()
         local extra = allAlive and " All suspects taken alive: bonus." or ""
         if c.fled > 0 then extra = (" %d suspect%s got away."):format(c.fled, c.fled > 1 and "s" or "") end
+        extra = table.concat(notes) .. extra
         notify(("NCPD: Scene clear. %d eddies, %+d rep.%s"):format(pay, rep, extra), 7)
         if rankName() ~= before then notify("NCPD: Promoted to " .. rankName() .. "!", 8) end
-        log(("call cleared: pay %d rep %+d (nonlethal %d/%d, fled %d)"):format(pay, rep, c.nonlethal, #c.suspects, c.fled))
+        log(("call cleared: pay %d rep %+d (nonlethal %d/%d, fled %d, heavy down %s, war early %s)"):format(
+            pay, rep, c.nonlethal, #c.suspects, c.fled, tostring(c.bossDown or false), tostring(c.warEarly or false)))
     elseif outcome == "late" then
         NCPD.save.rep = math.max(0, NCPD.save.rep - 2)
         writeSave()
@@ -471,12 +516,32 @@ local function prepareCall()
     if not NCPD.poolsBuilt then buildPools() end
     local faction = pickFaction()
     if not faction then log("no usable gang NPC records found; cannot dispatch"); return nil end
+    local s = NCPD.save
+    -- a rival gang for gang wars
+    local rivals = {}
+    for _, f in ipairs(FACTIONS) do
+        if f.name ~= faction and #NCPD.pools[f.name] > 0 then table.insert(rivals, f.name) end
+    end
     local choices = {}
     for _, t in ipairs(CALL_TYPES) do
-        if NCPD.save.rep >= (t.minRep or 0) then table.insert(choices, t) end
+        local ok = s.rep >= (t.minRep or 0)
+        if t.war and (not s.gangWarEnabled or #rivals == 0) then ok = false end
+        if ok then table.insert(choices, t) end
     end
     local ctype = choices[math.random(#choices)]
-    return { type = ctype, faction = faction, count = math.random(ctype.min, ctype.max) }
+    local prep = { type = ctype, faction = faction, count = math.random(ctype.min, ctype.max) }
+    if ctype.war then
+        prep.faction2 = rivals[math.random(#rivals)]
+        prep.count2 = math.random(ctype.min, ctype.max)
+    elseif s.bossEnabled and s.rep >= BOSS_MIN_REP and #(NCPD.bossPools[faction] or {}) > 0
+        and math.random(100) <= s.bossChance then
+        prep.boss = true    -- kept secret until it happens
+    end
+    local total = prep.count + (prep.count2 or 0)
+    if s.backupEnabled and s.rep >= BACKUP_MIN_REP and #NCPD.copPool > 0 and (ctype.war or total >= 4) then
+        prep.backup = (total >= 6) and 3 or 2
+    end
+    return prep
 end
 
 local function setMappin(c, pos)
@@ -497,14 +562,19 @@ local function dispatchCall(prep)
     local dist = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), target)
     local c = {
         type = prep.type, faction = prep.faction, count = prep.count,
+        faction2 = prep.faction2, count2 = prep.count2, boss = prep.boss, backup = prep.backup,
+        allies = {},
         state = "enroute", target = target, targetHow = how, pos = target,
         suspects = {}, nonlethal = 0, fled = 0, civDead = false,
         started = NCPD.now, deadline = NCPD.now + 120 + dist / 6,
     }
     setMappin(c, target)
     NCPD.call = c
-    log(("call dispatched: %s, %s x%d, %.0f m away (%s target, %s)"):format(
-        c.type.title, c.faction, c.count, dist, how, veh and "in vehicle" or "on foot"))
+    log(("call dispatched: %s, %s x%d%s, %.0f m away (%s target, %s)%s%s"):format(
+        c.type.title, c.faction, c.count,
+        c.faction2 and (" vs " .. c.faction2 .. " x" .. c.count2) or "",
+        dist, how, veh and "in vehicle" or "on foot",
+        c.boss and " [heavy planned]" or "", c.backup and (" [backup x" .. c.backup .. "]") or ""))
     return target
 end
 
@@ -527,17 +597,42 @@ local function sceneCentre(c)
     return p, "near V (" .. how .. ")"
 end
 
-local function spawnScene(c)
-    local pos, how = sceneCentre(c)
+local function angleTo(from, to)
+    local dy, dx = to.y - from.y, to.x - from.x
+    return math.atan2 and math.atan2(dy, dx) or math.atan(dy, dx)
+end
+
+-- A second walkable spot `dist` metres from `pos` on the same level, for a
+-- rival group, a heavy or backup. `toward` (optional) biases the direction.
+local function offsetCentre(pos, dist, toward)
+    local nav = navSystem()
+    local base = toward and angleTo(pos, toward) or (math.random() * math.pi * 2)
+    if nav then
+        for try = 0, 7 do
+            local step = math.floor((try + 1) / 2) * (math.pi / 6)
+            local ang = base + ((try % 2 == 0) and step or -step)
+            local p = Vector4.new(pos.x + math.cos(ang) * dist, pos.y + math.sin(ang) * dist, pos.z + 2, 1)
+            local ok, sp = pcall(function() return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, 2.0, 4) end)
+            if ok and sp and (sp.x ~= 0 or sp.y ~= 0) and math.abs(sp.z - pos.z) < 2.5 then
+                return sp, true
+            end
+        end
+    end
+    return Vector4.new(pos.x, pos.y, pos.z, 1), false
+end
+
+-- Spawn `count` NPCs from `pool` in a ring around `pos` into `list`.
+-- Returns how many spawned and how many had to stand at the centre.
+local function spawnGroup(list, pool, pos, count, fields)
     local des = Game.GetDynamicEntitySystem()
-    local pool = NCPD.pools[c.faction]
-    local centred = 0
-    for i = 1, c.count do
+    local added, centred = 0, 0
+    if not pool or #pool == 0 then return 0, 0 end
+    for i = 1, count do
         local rec = pool[math.random(#pool)]
         local ok, id = pcall(function()
             local spec = DynamicEntitySpec.new()
             spec.recordID = TweakDBID.new(rec)
-            local a = (i / c.count) * math.pi * 2
+            local a = (i / count) * math.pi * 2
             local spot, snapped = suspectSpot(pos, pos.x + math.cos(a) * 2.5, pos.y + math.sin(a) * 2.5)
             if not snapped then centred = centred + 1 end
             spec.position = spot
@@ -548,10 +643,26 @@ local function spawnScene(c)
             return des:CreateEntity(spec)
         end)
         if ok and id then
-            table.insert(c.suspects, { id = id, record = rec, hostile = false, done = false })
+            local e = { id = id, record = rec, hostile = false, done = false }
+            for k, v in pairs(fields or {}) do e[k] = v end
+            table.insert(list, e)
+            added = added + 1
         else
             log("spawn failed for " .. rec .. ": " .. tostring(id))
         end
+    end
+    return added, centred
+end
+
+local function spawnScene(c)
+    local pos, how = sceneCentre(c)
+    local _, centred = spawnGroup(c.suspects, NCPD.pools[c.faction], pos, c.count, { side = 1 })
+    local extra = ""
+    if c.faction2 then
+        local pos2, ok2 = offsetCentre(pos, 15)
+        local n2, cen2 = spawnGroup(c.suspects, NCPD.pools[c.faction2], pos2, c.count2, { side = 2 })
+        centred = centred + cen2
+        extra = (", rival %s x%d %s"):format(c.faction2, n2, ok2 and "15 m away" or "at centre (no ground found)")
     end
     if #c.suspects == 0 then return false end
     c.pos = pos
@@ -560,9 +671,29 @@ local function spawnScene(c)
     c.lastProgress = NCPD.now
     setMappin(c, pos)
     addSpot(pos)
-    log(("scene spawned: %s x%d at %.0f %.0f %.0f (%s, %d of %d at centre)"):format(
-        c.faction, #c.suspects, pos.x, pos.y, pos.z, how, centred, #c.suspects))
+    log(("scene spawned: %s x%d at %.0f %.0f %.0f (%s, %d of %d at centre%s)"):format(
+        c.faction, c.count, pos.x, pos.y, pos.z, how, centred, #c.suspects, extra))
+    if c.backup then
+        local bpos, okb = offsetCentre(pos, 22, Game.GetPlayer():GetWorldPosition())
+        local nb = spawnGroup(c.allies, NCPD.copPool, bpos, c.backup, { ally = true })
+        log(("NCPD backup: %d officer(s) %s"):format(nb, okb and "22 m from scene" or "at scene centre"))
+        if nb > 0 then notify("NCPD: Backup units on scene.", 4) end
+    end
     return true
+end
+
+-- The heavy arrives once the first wave is mostly down.
+local function spawnBoss(c)
+    local pos = offsetCentre(c.pos, 12)
+    local n = spawnGroup(c.suspects, NCPD.bossPools[c.faction], pos, 1, { side = 1, boss = true })
+    c.bossSpawned = true
+    c.lastProgress = NCPD.now
+    if n > 0 then
+        log(("heavy spawned: %s at %.0f %.0f %.0f"):format(c.suspects[#c.suspects].record, pos.x, pos.y, pos.z))
+    else
+        log("heavy spawn failed; call continues without it")
+        c.boss = false
+    end
 end
 
 -- The phone rings; the call is answered automatically or with the hotkey.
@@ -597,7 +728,9 @@ local function answerCall()
         lines = {
             ("%s V, this is NCPD Dispatch. You're the closest unit."):format(rankName()),
             ("We have a %s about %d meters %s of you."):format(c.type.title:lower(), dist, dir),
-            ("Witnesses report %d %s. Approach with caution."):format(c.count, c.faction),
+            c.faction2 and ("%s and %s are shooting it out, %d on %d. Let them thin each other out if you like."):format(
+                c.faction, c.faction2, c.count, c.count2)
+                or ("Witnesses report %d %s. Approach with caution."):format(c.count, c.faction),
             "Location's on your map. Dispatch out.",
         },
     }
@@ -670,6 +803,67 @@ local function makeHostile(npc)
     end)
 end
 
+-- Gang-war fighters keep their own gang's attitude group (so each side
+-- stays friendly to itself) and are made hostile to V and to every member
+-- of the other side, agent to agent. Allies are friendly to V and hostile
+-- to every suspect.
+local function setAttitude(a, b, att)
+    return pcall(function()
+        a:GetAttitudeAgent():SetAttitudeTowards(b:GetAttitudeAgent(), att)
+    end)
+end
+
+local function makeWarFighter(npc)
+    return setAttitude(npc, Game.GetPlayer(), EAIAttitude.AIA_Hostile)
+end
+
+local function makeAlly(npc)
+    return setAttitude(npc, Game.GetPlayer(), EAIAttitude.AIA_Friendly)
+end
+
+-- Link entities that have streamed in. Each pair is linked once, both ways.
+local function linkAttitudes(c, des)
+    c.linked = c.linked or {}
+    local live = {}
+    for idx, s in ipairs(c.suspects) do
+        if not s.done then
+            local e = des:GetEntity(s.id)
+            if e then table.insert(live, { s = s, e = e, idx = idx }) end
+        end
+    end
+    local made, failed = 0, 0
+    local function link(x, y, key)
+        if c.linked[key] then return end
+        local ok1 = setAttitude(x, y, EAIAttitude.AIA_Hostile)
+        local ok2 = setAttitude(y, x, EAIAttitude.AIA_Hostile)
+        c.linked[key] = true
+        if ok1 and ok2 then made = made + 1 else failed = failed + 1 end
+    end
+    if c.faction2 then
+        for i = 1, #live do
+            for j = i + 1, #live do
+                if live[i].s.side ~= live[j].s.side then
+                    link(live[i].e, live[j].e, "s" .. live[i].idx .. ":" .. live[j].idx)
+                end
+            end
+        end
+    end
+    for ai, a in ipairs(c.allies) do
+        local ae = des:GetEntity(a.id)
+        if ae then
+            if not a.hostile then
+                a.hostile = makeAlly(ae)
+                if not a.hostile then log("could not make officer friendly: " .. a.record) end
+            end
+            for _, l in ipairs(live) do link(ae, l.e, "a" .. ai .. ":" .. l.idx) end
+        end
+    end
+    if made + failed > 0 then
+        c.linkCount = (c.linkCount or 0) + made
+        log(("attitude links: %d set, %d failed (total %d)"):format(made, failed, c.linkCount))
+    end
+end
+
 local function updateCall()
     local c = NCPD.call
     if c.state == "enroute" then
@@ -691,13 +885,14 @@ local function updateCall()
             local npc = des:GetEntity(s.id)
             if npc then
                 if not s.hostile then
-                    s.hostile = makeHostile(npc)
+                    if c.faction2 then s.hostile = makeWarFighter(npc) else s.hostile = makeHostile(npc) end
                     if not s.hostile then log("could not set hostility on " .. s.record) end
                 end
                 local down, dead = isDown(npc)
                 if down then
                     s.done = true
                     c.lastProgress = NCPD.now
+                    if s.boss then c.bossDown = true; log("heavy down") end
                     if not dead then c.nonlethal = c.nonlethal + 1 end
                 else
                     remaining = remaining + 1
@@ -707,13 +902,55 @@ local function updateCall()
             end
         end
     end
+    -- attitude links for gang wars / backup, every 30 frames for a while,
+    -- so entities that stream in late (or a heavy) get linked too
+    if c.faction2 or #c.allies > 0 then
+        c.linkTick = (c.linkTick or 0) + 1
+        if c.linkTick % 30 == 1 then
+            local ok, err = pcall(linkAttitudes, c, des)
+            if not ok then log("attitude link error: " .. tostring(err)) end
+        end
+    end
+
+    -- gang war: bonus if V shows up while both sides are still standing
+    if c.faction2 and not c.arrivalChecked
+        and Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 40 then
+        c.arrivalChecked = true
+        local alive = { 0, 0 }
+        for _, s in ipairs(c.suspects) do
+            local side = s.side or 1
+            if not s.done then alive[side] = alive[side] + 1 end
+        end
+        c.warEarly = alive[1] > 0 and alive[2] > 0
+        log(("gang war: V on scene, alive %d vs %d"):format(alive[1], alive[2]))
+        if c.warEarly then notify("NCPD: They're still at it. Shut it down!", 4) end
+    end
+
+    -- surprise heavy: once the first wave is mostly down
+    if c.boss and not c.bossSpawned then
+        local down = #c.suspects - remaining
+        if not c.bossAt and (remaining == 0 or down >= math.ceil(#c.suspects * 0.6)) then
+            c.bossAt = NCPD.now + 6
+            NCPD.dialog = { t = 0, i = 0, lines = {
+                "V, heads up! Heavy incoming, " .. c.faction .. " sent a hitter.",
+                "Watch yourself. Dispatch out.",
+            } }
+            sound("ui_phone_incoming_call_positive")
+            log("heavy warning radioed")
+        end
+        if c.bossAt and NCPD.now >= c.bossAt then spawnBoss(c) end
+        if c.boss and not c.bossSpawned then return end   -- don't finish before the heavy shows
+    end
+
     if remaining == 0 then endCall("cleared"); return end
 
     -- Suspects V can't reach (stuck in geometry) shouldn't block the call:
     -- if V is at the scene, someone is already down, and nothing has
     -- changed for a minute, the rest "flee" and the call wraps up.
     local here = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 60
-    if here and remaining < #c.suspects and NCPD.now - c.lastProgress > 60 then
+    local grace = 60
+    for _, s in ipairs(c.suspects) do if s.boss and not s.done then grace = BOSS_GRACE end end
+    if here and remaining < #c.suspects and NCPD.now - c.lastProgress > grace then
         for _, s in ipairs(c.suspects) do
             if not s.done then
                 s.done = true
@@ -721,7 +958,7 @@ local function updateCall()
                 pcall(function() des:DeleteEntity(s.id) end)
             end
         end
-        log(("%d suspect(s) unreachable for 60 s; counted as fled"):format(c.fled))
+        log(("%d suspect(s) unreachable for %d s; counted as fled"):format(c.fled, grace))
         endCall("cleared")
         return
     end
@@ -827,6 +1064,17 @@ registerForEvent("onDraw", function()
         s.autoDispatch = ImGui.Checkbox("Automatic calls", s.autoDispatch)
         s.autoAnswer = ImGui.Checkbox("Auto-answer dispatch calls", s.autoAnswer)
         s.dispatchEvery = ImGui.SliderInt("Seconds between calls", s.dispatchEvery, 60, 900)
+        if ImGui.CollapsingHeader("Call types") then
+            s.bossEnabled = ImGui.Checkbox(("Surprise heavies (rep %d+)"):format(BOSS_MIN_REP), s.bossEnabled)
+            if s.bossEnabled then
+                s.bossChance = ImGui.SliderInt("Heavy chance %", s.bossChance, 0, 100)
+            end
+            s.gangWarEnabled = ImGui.Checkbox("Gang wars (rep 100+)", s.gangWarEnabled)
+            s.backupEnabled = ImGui.Checkbox(("NCPD backup on big calls (rep %d+)"):format(BACKUP_MIN_REP), s.backupEnabled)
+            local nb = 0
+            for _, p in pairs(NCPD.bossPools) do nb = nb + #p end
+            ImGui.Text(("Heavy records: %d   NCPD officers: %d"):format(nb, #NCPD.copPool))
+        end
         if s.onDuty and not NCPD.call and s.autoDispatch then
             ImGui.Text(("Next call in %d s"):format(math.max(0, s.dispatchEvery - math.floor(NCPD.timer))))
         end
