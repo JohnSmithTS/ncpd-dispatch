@@ -5,7 +5,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.8.5",
+    version = "0.9.0",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -44,7 +44,7 @@ local RING_TIMEOUT = 20         -- seconds before an unanswered call is missed
 local MISSED_RETRY = 90         -- seconds until dispatch tries again
 local OFFER_TIMEOUT = 45        -- seconds to confirm or deny a call before it goes to another unit
 local BOSS_MIN_REP = 30         -- rep needed before heavies can show up
-local BACKUP_MIN_REP = 150      -- Sergeant and up get NCPD backup
+local BACKUP_MIN_REP = 150      -- Trusted Contractor and up get NCPD backup
 local BOSS_PAY, BOSS_REP = 2500, 20
 local BOSS_GRACE = 90           -- seconds of no progress before a heavy "flees"
 local GONE_AFTER = 10           -- a suspect seen before and missing this long counts as down
@@ -85,11 +85,12 @@ local CALL_TYPES = {
 }
 
 local RANKS = {
-    { rep = 0,   name = "Patrol Officer" },
-    { rep = 60,  name = "Senior Officer" },
-    { rep = 150, name = "Sergeant" },
-    { rep = 300, name = "Detective" },
-    { rep = 600, name = "Lieutenant" },
+    -- V is a runner NCPD hires, not a cop: standing with the precinct
+    { rep = 0,   name = "Freelancer" },
+    { rep = 60,  name = "Contractor" },
+    { rep = 150, name = "Trusted Contractor" },
+    { rep = 300, name = "Preferred Contractor" },
+    { rep = 600, name = "Fixer-on-Call" },
 }
 
 ---------------------------------------------------------------- helpers
@@ -269,7 +270,7 @@ local function markReply(r)
     jset(REPLY_GROUP .. "/" .. r, REPLY_CLASS, gameJournalEntryState.Succeeded)
 end
 
-local function rankSlug(name) return (name:lower():gsub(" ", "_")) end
+local function rankSlug(name) return (name:lower():gsub("[^%w]+", "_")) end
 
 -- Dispatcher status line. With phone texts on, lines the phone already
 -- shows (phoneToo) are skipped; the rest use the game's own on-screen message.
@@ -898,7 +899,7 @@ local function endCall(outcome)
         if c.fled > 0 then extra = (" %d suspect%s got away."):format(c.fled, c.fled > 1 and "s" or "") end
         extra = table.concat(notes) .. extra
         notify(("NCPD: Scene clear. %d eddies, %+d rep.%s"):format(pay, rep, extra), 7)
-        if rankName() ~= before then notify("NCPD: Promoted to " .. rankName() .. "!", 8) end
+        if rankName() ~= before then notify("NCPD: New standing: " .. rankName() .. "!", 8) end
         if c.fled > 0 then text("result_fled")
         elseif allAlive then text("result_clear_alive")
         else text("result_clear") end
@@ -908,19 +909,19 @@ local function endCall(outcome)
             pay, rep, c.nonlethal, #c.suspects, c.fled, tostring(c.bossDown or false), tostring(c.warEarly or false), c.saved or 0, #(c.victims or {})))
     elseif outcome == "void" then
         -- not V's fault: no penalty, next call comes sooner
-        notify("NCPD: Disregard, another unit is closer to that scene.", 6)
+        notify("NCPD: Disregard, our units are closer to that scene.", 6)
         text("result_void")
         log("call voided: no walking route to the scene")
     elseif outcome == "late" then
         NCPD.save.rep = math.max(0, NCPD.save.rep - 2)
         writeSave()
-        notify("NCPD: Too slow, another unit took the call. -2 rep.", 6)
+        notify("NCPD: Too slow, our units got there first. -2 rep.", 6)
         text("result_late")
         log("call missed: did not arrive in time")
     else
         NCPD.save.rep = math.max(0, NCPD.save.rep - 5)
         writeSave()
-        notify("NCPD: Call abandoned. Dispatch is not impressed. -5 rep.", 6)
+        notify("NCPD: Contract abandoned. The precinct is not impressed. -5 rep.", 6)
         text("result_abandoned")
         log("call abandoned")
     end
@@ -1312,12 +1313,12 @@ local function resolveOffer(accept, how)
     if not accept then
         if how == "timeout" then
             text("offer_timeout")
-            say("NO REPLY", "NCPD Dispatch\nThe call went to another unit.", 5, true)
+            say("NO REPLY", "NCPD Dispatch\nThey gave the job to someone else.", 5, true)
             NCPD.timer = math.max(0, NCPD.save.dispatchEvery - MISSED_RETRY)
             log("call not confirmed in time")
         else
             text("deny_ack")
-            say("CALL DECLINED", "NCPD Dispatch\nPassed to another unit.", 4, true)
+            say("CALL DECLINED", "NCPD Dispatch\nThey'll find someone else.", 4, true)
             NCPD.timer = 0
             log("call declined (" .. how .. ")")
         end
@@ -1327,7 +1328,7 @@ local function resolveOffer(accept, how)
     log("call confirmed (" .. how .. ")")
     local pos = dispatchCall(o.prep)
     if not pos then
-        say("NCPD DISPATCH", "Disregard, unit. Situation resolved.", 5)
+        say("NCPD DISPATCH", "Disregard, V. Situation resolved.", 5)
         NCPD.dialog = { lines = { }, t = 0, i = 0, hold = 4 }
         return
     end
@@ -1340,10 +1341,10 @@ local function resolveOffer(accept, how)
             c.victimCount > 0 and ", civilians caught in it" or "")
     -- the phone already said "location's on your map"; only the situation is new
     local lines = NCPD.save.phoneTexts and { situation } or {
-        ("Copy that, %s V. You're the closest unit."):format(rankName()),
+        "Good. You're the closest runner we've got.",
         ("We have a %s about %d meters %s of you."):format(c.type.title:lower(), dist, dir),
         situation,
-        "Location's on your map. Dispatch out.",
+        "Location's on your map. Payment on completion.",
     }
     NCPD.dialog = { t = 0, i = 0, lines = lines }
 end
@@ -1601,8 +1602,8 @@ local function updateCall()
         if not c.bossAt and (remaining == 0 or down >= math.ceil(#c.suspects * 0.6)) then
             c.bossAt = NCPD.now + 6
             NCPD.dialog = { t = 0, i = 0, lines = {
-                "V, heads up! Heavy incoming, " .. c.faction .. " sent a hitter.",
-                "Watch yourself. Dispatch out.",
+                "V, heads up! " .. c.faction .. " called in a hitter.",
+                "Watch yourself.",
             }, phoneToo = true }
             sound("ui_phone_incoming_call_positive")
             log("heavy warning radioed")
@@ -1691,7 +1692,7 @@ registerHotkey("ncpd_duty", "Toggle NCPD duty", function()
     NCPD.save.onDuty = not NCPD.save.onDuty
     NCPD.timer = 0
     writeSave()
-    notify(NCPD.save.onDuty and ("NCPD: On duty. " .. rankName() .. ", stand by for calls.") or "NCPD: Off duty.", 5)
+    notify(NCPD.save.onDuty and ("NCPD: Available for contracts (" .. rankName() .. "). Stand by.") or "NCPD: Not taking contracts.", 5)
     if NCPD.save.onDuty then text("on_duty") end
 end)
 
@@ -1718,7 +1719,7 @@ registerForEvent("onUpdate", function(dt)
         NCPD.greetIn = (NCPD.greetIn or 15) - dt
         if NCPD.greetIn <= 0 then
             NCPD.greeted = true
-            notify(("NCPD: %s V on duty. Stand by for calls."):format(rankName()), 6)
+            notify(("NCPD: Available for contracts (%s). Stand by."):format(rankName()), 6)
         end
     end
 
@@ -1772,7 +1773,7 @@ registerForEvent("onDraw", function()
     ImGui.SetNextWindowSize(420, 300, ImGuiCond.FirstUseEver)
     if ImGui.Begin("NCPD Dispatch") then
         local s = NCPD.save
-        ImGui.Text(("Rank: %s   Rep: %d"):format(rankName(), s.rep))
+        ImGui.Text(("Standing: %s   Rep: %d"):format(rankName(), s.rep))
         ImGui.Text(("Calls cleared: %d   Taken alive: %d   Earned: %d"):format(s.calls, s.nonlethal, s.earned))
         ImGui.Separator()
         s.onDuty = ImGui.Checkbox("On duty (remembered)", s.onDuty)
