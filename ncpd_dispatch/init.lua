@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.7.0",
+    version = "0.7.1",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -477,9 +477,12 @@ local function writeSpots()
     if f then f:write(json.encode(NCPD.spots)); f:close(); NCPD.spotsDirty = 0 end
 end
 
+local BANNED_FILE = "ncpd_spots_banned.json"
+NCPD.banned = NCPD.banned or {}   -- cellKey -> true: spots that turned out unreachable
+
 local function addSpot(p)
     local k = cellKey(p.x, p.y)
-    if NCPD.spotCells[k] then return false end
+    if NCPD.spotCells[k] or NCPD.banned[k] then return false end
     NCPD.spotCells[k] = true
     table.insert(NCPD.spots, { x = math.floor(p.x * 10) / 10, y = math.floor(p.y * 10) / 10, z = math.floor(p.z * 10) / 10 })
     NCPD.spotsDirty = NCPD.spotsDirty + 1
@@ -487,15 +490,41 @@ local function addSpot(p)
     return true
 end
 
+-- Forget a spot V couldn't get to, and never learn its 50 m cell again.
+local function banSpot(p, why)
+    local k = cellKey(p.x, p.y)
+    NCPD.banned[k] = true
+    local kept, removed = {}, 0
+    for _, s in ipairs(NCPD.spots) do
+        if cellKey(s.x, s.y) == k then removed = removed + 1 else table.insert(kept, s) end
+    end
+    NCPD.spots = kept
+    NCPD.spotCells[k] = nil
+    local keys = {}
+    for b in pairs(NCPD.banned) do table.insert(keys, b) end
+    local f = io.open(BANNED_FILE, "w")
+    if f then f:write(json.encode(keys)); f:close() end
+    NCPD.spotsDirty = NCPD.spotsDirty + 1
+    writeSpots()
+    log(("spot %.0f %.0f banned (%s), %d removed, %d spots left"):format(p.x, p.y, why, removed, #NCPD.spots))
+end
+
 local function loadSpots()
+    local bf = io.open(BANNED_FILE, "r")
+    if bf then
+        local ok, keys = pcall(json.decode, bf:read("*a"))
+        bf:close()
+        if ok and type(keys) == "table" then for _, k in ipairs(keys) do NCPD.banned[k] = true end end
+    end
     local f = io.open(SPOTS_FILE, "r")
     if not f then return end
     local ok, data = pcall(json.decode, f:read("*a"))
     f:close()
     if ok and type(data) == "table" then
         for _, p in ipairs(data) do
-            if p.x and p.y and p.z and not NCPD.spotCells[cellKey(p.x, p.y)] then
-                NCPD.spotCells[cellKey(p.x, p.y)] = true
+            local k = p.x and p.y and cellKey(p.x, p.y)
+            if k and p.z and not NCPD.spotCells[k] and not NCPD.banned[k] then
+                NCPD.spotCells[k] = true
                 table.insert(NCPD.spots, p)
             end
         end
@@ -589,6 +618,7 @@ end
 local function questOff(c)
     local Q = JournalNotifyOption.DoNotNotify
     if c and c.obj then
+        jstate(c.obj .. "/call_mappin", "gameJournalQuestMapPin", gameJournalEntryState.Inactive, Q)
         jstate(c.obj, OBJ_CLASS, gameJournalEntryState.Inactive, Q)
     else
         for _, t in ipairs(CALL_TYPES) do
@@ -673,6 +703,13 @@ local function questEnd(c, outcome)
     jstate(c.obj, OBJ_CLASS,
         outcome == "cleared" and gameJournalEntryState.Succeeded or gameJournalEntryState.Failed, Q)
     pcall(function() Game.GetJournalManager():UntrackEntry() end)
+    -- switching the objective off leaves its registered pin on the map, so
+    -- take the pin off directly
+    if c.questPin then
+        local ok = pcall(function() Game.GetMappinSystem():UnregisterMappin(c.questPin) end)
+        log("GPS pin removed (" .. outcome .. ")" .. (ok and "" or ": unregister failed"))
+        c.questPin = nil
+    end
     questOff(c)
     c.questOn = false
 end
@@ -803,6 +840,11 @@ local function endCall(outcome)
         text("result_abandoned")
         log("call abandoned")
     end
+    -- learn spots from scenes that worked; forget targets V gave up on
+    if outcome == "cleared" and c.pos then addSpot(c.pos)
+    elseif (outcome == "abandoned" or outcome == "late") and (c.targetHow or ""):match("^learned") then
+        banSpot(c.target, outcome)
+    end
     restorePolice(outcome)
     questEnd(c, outcome)
     NCPD.call = nil
@@ -888,19 +930,92 @@ local function dispatchCall(prep)
 end
 
 -- Find walkable ground at the destination now that its navmesh is loaded.
+-- Walking route check. Only meaningful near V, where the navmesh is
+-- streamed in (the scene is placed at 150 m). Returns true / false, or nil
+-- when the query itself isn't available (then nothing is rejected).
+local PATH_DETOUR = 2.5   -- a route this many times the straight line (+60 m) counts as no way in
+
+local function navStart()
+    local nav = navSystem()
+    if not nav then return nil end
+    local o = Game.GetPlayer():GetWorldPosition()
+    local ok, p = pcall(function()
+        return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(Vector4.new(o.x, o.y, o.z + 1.5, 1), 2.0, 4)
+    end)
+    if ok and p and (p.x ~= 0 or p.y ~= 0) and Vector4.Distance(p, o) < 6 then return p end
+end
+
+local function walkPath(from, to)
+    local ok, path = pcall(function()
+        return navSystem():CalculatePathOnlyHumanNavmesh(from, to, NavGenAgentSize.Human, 2.0)
+    end)
+    if not ok then return nil, "error " .. tostring(path) end
+    local pts = path and path.path
+    if not pts or #pts == 0 then return false, "no path" end
+    if Vector4.Distance(pts[#pts], to) > 4 then return false, "path ends short" end
+    local len = 0
+    for i = 2, #pts do len = len + Vector4.Distance(pts[i - 1], pts[i]) end
+    local straight = Vector4.Distance(from, to)
+    if len > straight * PATH_DETOUR + 60 then
+        return false, ("detour %.0f m for %.0f m"):format(len, straight)
+    end
+    return true, ("path %.0f m"):format(len)
+end
+
+-- Find walkable ground at the destination now that its navmesh is loaded,
+-- that V can actually walk to. Falls back to a learned spot near the target,
+-- then to a spot near V; an unreachable learned target is banned.
 local function sceneCentre(c)
     local nav = navSystem()
-    local ref = (c.targetHow == "learned") and c.target.z or Game.GetPlayer():GetWorldPosition().z
+    local ref = (c.targetHow or ""):match("^learned") and c.target.z or Game.GetPlayer():GetWorldPosition().z
+    local start = nav and navStart()
+    local reasons, checked = {}, start ~= nil
+    if nav and not start then log("path check skipped: no navmesh under V") end
+    local function reachable(sp)
+        if not start then return true end
+        local ok, info = walkPath(start, sp)
+        if ok == nil then
+            log("path check unavailable: " .. info); start = nil; checked = false
+            return true
+        end
+        if not ok and #reasons < 4 then table.insert(reasons, info) end
+        c.pathInfo = info
+        return ok
+    end
     if nav then
         for try = 1, 14 do
             local r = (try <= 3) and 0 or ((try <= 8) and 20 or 45)
             local ang = math.random() * math.pi * 2
             local p = Vector4.new(c.target.x + math.cos(ang) * r, c.target.y + math.sin(ang) * r, ref + 4, 1)
             local ok, sp = pcall(function() return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, 3.0, 8) end)
-            if ok and sp and (sp.x ~= 0 or sp.y ~= 0) and math.abs(sp.z - ref) < 6 then
-                return sp, "at target"
+            if ok and sp and (sp.x ~= 0 or sp.y ~= 0) and math.abs(sp.z - ref) < 6 and reachable(sp) then
+                return sp, "at target" .. (checked and (", " .. c.pathInfo) or "")
             end
         end
+        if checked then
+            -- the nearest learned spots around the target that V can walk to
+            local near = {}
+            for _, p in ipairs(NCPD.spots) do
+                local d = math.sqrt((p.x - c.target.x) ^ 2 + (p.y - c.target.y) ^ 2)
+                if d > 5 and d < 120 then table.insert(near, { d = d, p = p }) end
+            end
+            table.sort(near, function(a, b) return a.d < b.d end)
+            for i = 1, math.min(#near, 6) do
+                local q = near[i].p
+                local ok, sp = pcall(function()
+                    return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(Vector4.new(q.x, q.y, q.z + 2, 1), 2.0, 4)
+                end)
+                if ok and sp and (sp.x ~= 0 or sp.y ~= 0) and reachable(sp) then
+                    log(("target unreachable (%s); moved %.0f m to a learned spot"):format(table.concat(reasons, "; "), near[i].d))
+                    if (c.targetHow or ""):match("^learned") then banSpot(c.target, "no walking route") end
+                    return sp, "nearby spot, " .. c.pathInfo
+                end
+            end
+        end
+    end
+    if checked then
+        log("target unreachable: " .. table.concat(reasons, "; "))
+        if (c.targetHow or ""):match("^learned") then banSpot(c.target, "no walking route") end
     end
     local p, how = pickScene()   -- last resort: a spot near V
     return p, "near V (" .. how .. ")"
@@ -983,7 +1098,6 @@ local function spawnScene(c)
     c.arrivedAt = NCPD.now
     c.lastProgress = NCPD.now
     setMappin(c, pos)
-    addSpot(pos)
     log(("scene spawned: %s x%d at %.0f %.0f %.0f (%s, %d of %d at centre%s)"):format(
         c.faction, c.count, pos.x, pos.y, pos.z, how, centred, #c.suspects, extra))
     if c.victimCount > 0 then
@@ -1389,6 +1503,7 @@ end)
 registerForEvent("onShutdown", function()
     if NCPD.offer then pcall(repliesOff) end
     restorePolice("shutdown")
+    if NCPD.call then pcall(questEnd, NCPD.call, "cancelled") end
     stopSound("ui_phone_incoming_call")
     hidePanel()
     clearMappin()
