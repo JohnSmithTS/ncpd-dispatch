@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.4.1",
+    version = "0.4.2",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -34,6 +34,7 @@ local NCPD = {
         gangWarEnabled = true,  -- two rival gangs fighting each other
         backupEnabled = true,   -- friendly NCPD officers on big calls
         victimsEnabled = true,  -- civilians at the scene that suspects go after
+        policeCover = true,     -- NCPD doesn't put a wanted level on V during a call
     },
 }
 
@@ -474,6 +475,44 @@ local function clearMappin()
     end
 end
 
+-- Police cover: while V works a scene, the prevention (wanted) system is
+-- switched off under our own source name, the way quests do it; when the call
+-- ends it's switched back on and any heat V picked up is cleared.
+local POLICE_SOURCE = "NCPDDispatch"
+
+local function preventionRequest(make)
+    return pcall(function()
+        local sys = Game.GetScriptableSystemsContainer():Get(CName.new("PreventionSystem"))
+        sys:QueueRequest(make())
+    end)
+end
+
+local function setPoliceActive(active)
+    local ok, err = preventionRequest(function()
+        local r = TogglePreventionSystem.new()
+        r.isActive = active
+        r.sourceName = CName.new(POLICE_SOURCE)
+        return r
+    end)
+    if not ok then log("police toggle failed: " .. tostring(err)) end
+    NCPD.policeOff = (not active) and ok
+    return ok
+end
+
+local function clearHeat()
+    local ok, err = preventionRequest(function() return PreventionForceDeescalateRequest.new() end)
+    if not ok then log("clearing wanted level failed: " .. tostring(err)) end
+    return ok
+end
+
+local function restorePolice(why)
+    if NCPD.policeOff then
+        setPoliceActive(true)
+        clearHeat()
+        log("police cover ended (" .. why .. "), wanted level cleared")
+    end
+end
+
 local function despawnAll()
     pcall(function() Game.GetDynamicEntitySystem():DeleteTagged(NCPD.tag) end)
 end
@@ -508,6 +547,9 @@ local function endCall(outcome)
             table.insert(notes, (" %d civilian%s saved."):format(saved, saved > 1 and "s" or ""))
         end
         c.saved = saved
+        local unseen = 0
+        for _, v in ipairs(c.victims or {}) do if not v.seen then unseen = unseen + 1 end end
+        if unseen > 0 then log(("%d victim(s) never streamed in"):format(unseen)) end
         if c.bossDown then
             pay = pay + BOSS_PAY; rep = rep + BOSS_REP
             table.insert(notes, " Heavy neutralized.")
@@ -543,6 +585,7 @@ local function endCall(outcome)
         notify("NCPD: Call abandoned. Dispatch is not impressed. -5 rep.", 6)
         log("call abandoned")
     end
+    restorePolice(outcome)
     NCPD.call = nil
     NCPD.timer = 0
     -- leave bodies for a bit, then clean up
@@ -710,6 +753,10 @@ local function spawnScene(c)
     if #c.suspects == 0 then return false end
     c.pos = pos
     c.state = "active"
+    if NCPD.save.policeCover then
+        clearHeat()   -- anything from the drive over is forgiven too
+        if setPoliceActive(false) then log("police cover on: NCPD stands down for this scene") end
+    end
     c.arrivedAt = NCPD.now
     c.lastProgress = NCPD.now
     setMappin(c, pos)
@@ -901,6 +948,7 @@ local function linkAttitudes(c, des)
     for vi, v in ipairs(c.victims) do
         local ve = des:GetEntity(v.id)
         if ve then
+            v.seen = true
             for _, l in ipairs(live) do link(l.e, ve, "v" .. vi .. ":" .. l.idx) end
         end
     end
@@ -1058,6 +1106,7 @@ registerForEvent("onInit", function()
 end)
 
 registerForEvent("onShutdown", function()
+    restorePolice("shutdown")
     stopSound("ui_phone_incoming_call")
     hidePanel()
     clearMappin()
@@ -1085,6 +1134,12 @@ registerHotkey("ncpd_decline", "Decline NCPD call", function() declineCall(false
 registerForEvent("onUpdate", function(dt)
     NCPD.now = NCPD.now + dt
     if not Game.GetPlayer() or gamePaused() then return end
+
+    -- after a load (or a crash mid-call) make sure our police switch is on
+    if not NCPD.policeChecked then
+        NCPD.policeChecked = true
+        if not NCPD.call then setPoliceActive(true) end
+    end
 
     -- say hello once per session if duty was left on
     if NCPD.save.onDuty and not NCPD.greeted then
@@ -1149,6 +1204,7 @@ registerForEvent("onDraw", function()
                 s.bossChance = ImGui.SliderInt("Heavy chance %", s.bossChance, 0, 100)
             end
             s.gangWarEnabled = ImGui.Checkbox("Gang wars (rep 100+)", s.gangWarEnabled)
+            s.policeCover = ImGui.Checkbox("Police don't react during calls", s.policeCover)
             s.victimsEnabled = ImGui.Checkbox("Civilians at robbery/assault scenes", s.victimsEnabled)
             s.backupEnabled = ImGui.Checkbox(("NCPD backup on big calls (rep %d+)"):format(BACKUP_MIN_REP), s.backupEnabled)
             local nb = 0
