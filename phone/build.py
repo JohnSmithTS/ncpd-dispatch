@@ -11,6 +11,16 @@ import json, sys, os
 
 src, out = sys.argv[1], sys.argv[2]
 spec = json.load(open(src))
+# expand per-gang templates: {gang} -> slug, {Gang} -> display name
+for t in spec.get("templates", []):
+    for slug, name in spec.get("gangs", {}).items():
+        spec["messages"].append({
+            "id": t["id"].replace("{gang}", slug),
+            "delay": t.get("delay", 2),
+            "text": t["text"].replace("{Gang}", name),
+        })
+ids = [m["id"] for m in spec["messages"]]
+assert len(ids) == len(set(ids)), "duplicate message ids"
 KEY = "ncpd_dispatch_"   # prefix for all localization keys
 
 handle = [0]

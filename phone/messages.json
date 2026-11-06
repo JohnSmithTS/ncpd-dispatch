@@ -2,8 +2,36 @@
   "contact": "ncpd_dispatcher",
   "conversation": "ncpd_dispatch_calls",
   "conversation_title": "NCPD Dispatch",
+  "gangs": {
+    "maelstrom": "Maelstrom",
+    "tyger_claws": "Tyger Claws",
+    "valentinos": "Valentinos",
+    "sixth_street": "6th Street",
+    "animals": "Animals",
+    "scavengers": "Scavengers",
+    "voodoo_boys": "Voodoo Boys",
+    "wraiths": "Wraiths"
+  },
+  "templates": [
+    { "id": "robbery_{gang}", "text": "10-31, armed robbery in progress. Suspects are {Gang}, civilians on scene. Location's on your map, respond code 3." },
+    { "id": "assault_{gang}", "text": "10-34, assault in progress. A {Gang} crew is working someone over. Marker sent, get there before it turns into a homicide." },
+    { "id": "shots_{gang}", "text": "10-71, shots fired, multiple suspects. Witnesses ID them as {Gang}. Expect resistance. Location on your map." },
+    { "id": "war_{gang}", "text": "All units: {Gang} and a rival crew are shooting it out in the street. You're closest. Let them thin each other out, then shut it down." }
+  ],
   "messages": [
-    { "id": "test_1", "delay": 2, "text": "NCPD Dispatch to V. Radio check, this is a test message." },
-    { "id": "test_2", "delay": 2, "text": "Second test message. If you can read this twice, repeats work." }
+    { "id": "radio_check", "delay": 1, "text": "NCPD Dispatch to V. Radio check, reading you five by five." },
+    { "id": "on_duty", "delay": 1, "text": "Dispatch copies, you're on duty. Stand by for calls." },
+    { "id": "missed_call", "delay": 1, "text": "Dispatch tried your line. Pick up next time, we'll call back shortly." },
+    { "id": "heavy_warning", "delay": 0, "text": "Heads up! Heavy incoming. They called in a hitter, watch yourself." },
+    { "id": "result_clear", "delay": 2, "text": "Scene's clear, good work. Payment transferred to your account." },
+    { "id": "result_clear_alive", "delay": 2, "text": "Scene's clear and every suspect brought in alive. Brass noticed. Bonus transferred." },
+    { "id": "result_civilians_saved", "delay": 3, "text": "Paramedics report the civilians made it. That's the job, V. Bonus added." },
+    { "id": "result_fled", "delay": 2, "text": "Scene's clear, but we've got runners. Half pay. Tighten it up next time." },
+    { "id": "result_late", "delay": 1, "text": "Disregard, another unit took the call. Response time matters, V." },
+    { "id": "result_abandoned", "delay": 1, "text": "You left an active scene. That goes in your file." },
+    { "id": "promo_senior_officer", "delay": 4, "text": "Congratulations, Senior Officer. Heavier calls are coming your way." },
+    { "id": "promo_sergeant", "delay": 4, "text": "Sergeant's stripes, V. You'll have backup units on the big calls now." },
+    { "id": "promo_detective", "delay": 4, "text": "Detective. Not bad for someone who started on patrol. Keep it up." },
+    { "id": "promo_lieutenant", "delay": 4, "text": "Lieutenant. The precinct is proud of you. Night City still needs you out there." }
   ]
 }

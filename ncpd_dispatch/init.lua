@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.5.0-test",
+    version = "0.5.0",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -35,6 +35,7 @@ local NCPD = {
         backupEnabled = true,   -- friendly NCPD officers on big calls
         victimsEnabled = true,  -- civilians at the scene that suspects go after
         policeCover = true,     -- NCPD doesn't put a wanted level on V during a call
+        phoneTexts = true,      -- real texts from the NCPD Dispatcher contact
     },
 }
 
@@ -73,11 +74,11 @@ local VICTIM_SAVE_PAY, VICTIM_SAVE_REP = 250, 3
 local RECENT_KEEP, RECENT_RADIUS = 6, 60
 
 local CALL_TYPES = {
-    { title = "Armed robbery in progress", min = 2, max = 3, pay = 1200, rep = 10 },
-    { title = "Gang assault in progress",  min = 3, max = 4, pay = 1800, rep = 15 },
-    { title = "Shots fired, multiple suspects", min = 4, max = 6, pay = 2600, rep = 25, minRep = 60 },
+    { key = "robbery", title = "Armed robbery in progress", min = 2, max = 3, pay = 1200, rep = 10 },
+    { key = "assault", title = "Gang assault in progress",  min = 3, max = 4, pay = 1800, rep = 15 },
+    { key = "shots", title = "Shots fired, multiple suspects", min = 4, max = 6, pay = 2600, rep = 25, minRep = 60 },
     -- min/max are per side; pay is a base plus perSuspect for each one down
-    { title = "Gang war in progress", war = true, min = 3, max = 4, pay = 1500, perSuspect = 350, rep = 30, minRep = 100 },
+    { key = "war", title = "Gang war in progress", war = true, min = 3, max = 4, pay = 1500, perSuspect = 350, rep = 30, minRep = 100 },
 }
 
 local RANKS = {
@@ -273,6 +274,19 @@ function NCPD.sendText(msgId)
     log(("text %s: contact %s, conversation %s, reset %s, send %s (entry lookup %s)"):format(
         msgId, results[1], results[2], results[3], results[4], found and "ok" or "failed"))
 end
+
+-- Message ids in phone/messages.json use these gang slugs.
+local GANG_SLUG = {
+    ["Maelstrom"] = "maelstrom", ["Tyger Claws"] = "tyger_claws", ["Valentinos"] = "valentinos",
+    ["6th Street"] = "sixth_street", ["Animals"] = "animals", ["Scavengers"] = "scavengers",
+    ["Voodoo Boys"] = "voodoo_boys", ["Wraiths"] = "wraiths",
+}
+
+local function text(id)
+    if NCPD.save.phoneTexts then pcall(NCPD.sendText, id) end
+end
+
+local function rankSlug(name) return (name:lower():gsub(" ", "_")) end
 
 -- Show a line in the panel, or as an on-screen message if the panel failed.
 local function say(title, body, seconds, color)
@@ -597,17 +611,24 @@ local function endCall(outcome)
         extra = table.concat(notes) .. extra
         notify(("NCPD: Scene clear. %d eddies, %+d rep.%s"):format(pay, rep, extra), 7)
         if rankName() ~= before then notify("NCPD: Promoted to " .. rankName() .. "!", 8) end
+        if c.fled > 0 then text("result_fled")
+        elseif allAlive then text("result_clear_alive")
+        else text("result_clear") end
+        if saved > 0 then text("result_civilians_saved") end
+        if rankName() ~= before then text("promo_" .. rankSlug(rankName())) end
         log(("call cleared: pay %d rep %+d (nonlethal %d/%d, fled %d, heavy down %s, war early %s, civilians saved %d/%d)"):format(
             pay, rep, c.nonlethal, #c.suspects, c.fled, tostring(c.bossDown or false), tostring(c.warEarly or false), c.saved or 0, #(c.victims or {})))
     elseif outcome == "late" then
         NCPD.save.rep = math.max(0, NCPD.save.rep - 2)
         writeSave()
         notify("NCPD: Too slow, another unit took the call. -2 rep.", 6)
+        text("result_late")
         log("call missed: did not arrive in time")
     else
         NCPD.save.rep = math.max(0, NCPD.save.rep - 5)
         writeSave()
         notify("NCPD: Call abandoned. Dispatch is not impressed. -5 rep.", 6)
+        text("result_abandoned")
         log("call abandoned")
     end
     restorePolice(outcome)
@@ -836,6 +857,10 @@ local function answerCall()
     sound("ui_phone_incoming_call_stop")
     sound("ui_phone_incoming_call_positive")
     local pos = dispatchCall(r.prep)
+    if pos then
+        local slug = GANG_SLUG[r.prep.faction]
+        if slug and r.prep.type.key then text(r.prep.type.key .. "_" .. slug) end
+    end
     if not pos then
         say("NCPD DISPATCH", "Disregard, unit. Situation resolved.", 5)
         NCPD.dialog = { lines = { }, t = 0, i = 0, hold = 4 }
@@ -864,6 +889,7 @@ local function declineCall(missed)
     sound("ui_phone_incoming_call_stop")
     if missed then
         say("MISSED CALL", "NCPD Dispatch\nThey'll try again shortly.", 5, RED)
+        text("missed_call")
         NCPD.timer = math.max(0, NCPD.save.dispatchEvery - MISSED_RETRY)
         log("call missed")
     else
@@ -1089,6 +1115,7 @@ local function updateCall()
             } }
             sound("ui_phone_incoming_call_positive")
             log("heavy warning radioed")
+            text("heavy_warning")
         end
         if c.bossAt and NCPD.now >= c.bossAt then spawnBoss(c) end
         if c.boss and not c.bossSpawned then return end   -- don't finish before the heavy shows
@@ -1150,6 +1177,7 @@ registerHotkey("ncpd_duty", "Toggle NCPD duty", function()
     NCPD.timer = 0
     writeSave()
     notify(NCPD.save.onDuty and ("NCPD: On duty. " .. rankName() .. ", stand by for calls.") or "NCPD: Off duty.", 5)
+    if NCPD.save.onDuty then text("on_duty") end
 end)
 
 registerHotkey("ncpd_call", "Request NCPD call now", function() startCall() end)
@@ -1267,11 +1295,9 @@ registerForEvent("onDraw", function()
         ImGui.SameLine()
         if ImGui.Button("Rebuild NPC pools") then buildPools() end
         ImGui.Separator()
-        if ImGui.CollapsingHeader("Phone texts (test)") then
-            if ImGui.Button("Send test text 1") then NCPD.sendText("test_1") end
-            ImGui.SameLine()
-            if ImGui.Button("Send test text 2") then NCPD.sendText("test_2") end
-        end
+        s.phoneTexts = ImGui.Checkbox("Texts from NCPD Dispatcher", s.phoneTexts)
+        ImGui.SameLine()
+        if ImGui.Button("Radio check") then NCPD.sendText("radio_check") end
         ImGui.Text(("Learned street spots: %d"):format(#NCPD.spots))
         ImGui.TextWrapped("Last: " .. NCPD.lastLog)
     end
