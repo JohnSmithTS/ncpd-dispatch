@@ -63,6 +63,88 @@ contact = {"HandleId": h(), "Data": {
     "type": "Caller",
     "useFlatMessageLayout": 1,
 }}
+def ref_none(kind, storage="string", value="None"):
+    return {"$type": kind, "$storage": storage, "$value": value}
+
+q = spec["quest"]
+objective = {"HandleId": h(), "Data": {
+    "$type": "gameJournalQuestObjective",
+    "counter": 0,
+    "description": loc("quest_objective"),
+    "districtID": "",
+    "entries": [{"HandleId": h(), "Data": {
+        "$type": "gameJournalQuestMapPin",
+        "enableGPS": 1,
+        "entries": [],
+        "id": "call_mappin",
+        "journalEntryOverrideDataList": [],
+        "mappinData": {
+            "$type": "gamemappinsMappinData",
+            "active": 1,
+            "debugCaption": "",
+            "localizedCaption": {"unk1": "0", "value": ""},
+            "mappinType": ref_none("TweakDBID", "string", "Mappins.QuestStaticMappinDefinition"),
+            "scriptData": None,
+            "variant": q.get("variant", "DefaultQuestVariant"),
+            "visibleThroughWalls": 1,
+        },
+        # no node reference: ArchiveXL uses the offset as a world position;
+        # the mod moves the pin to each call with MappinSystem.SetMappinPosition
+        "offset": {"$type": "Vector3", "X": q["start"][0], "Y": q["start"][1], "Z": q["start"][2]},
+        "reference": {
+            "$type": "gameEntityReference",
+            "dynamicEntityUniqueName": ref_none("CName"),
+            "names": [],
+            "reference": ref_none("NodeRef", "uint64", "0"),
+            "sceneActorContextName": ref_none("CName"),
+            "slotName": ref_none("CName"),
+            "type": "EntityRef",
+        },
+        "slotName": ref_none("CName"),
+        "uiAnimation": ref_none("TweakDBID", "uint64", "0"),
+    }}],
+    "id": "respond",
+    "itemID": ref_none("TweakDBID", "uint64", "0"),
+    "journalEntryOverrideDataList": [],
+    "locationPrefabRef": ref_none("NodeRef", "uint64", "0"),
+    "optional": 0,
+}}
+quest = {"HandleId": h(), "Data": {
+    "$type": "gameJournalQuest",
+    "districtID": "",
+    "entries": [
+        {"HandleId": h(), "Data": {
+            "$type": "gameJournalQuestDescription",
+            "description": loc("quest_description"),
+            "id": "description",
+            "journalEntryOverrideDataList": [],
+        }},
+        {"HandleId": h(), "Data": {
+            "$type": "gameJournalQuestPhase",
+            "entries": [objective],
+            "id": "call",
+            "journalEntryOverrideDataList": [],
+            "locationPrefabRef": ref_none("NodeRef", "uint64", "0"),
+        }},
+    ],
+    "id": q["id"],
+    "journalEntryOverrideDataList": [],
+    "recommendedLevelID": ref_none("TweakDBID", "uint64", "0"),
+    "title": loc("quest_title"),
+    "type": q.get("type", "Contract"),
+}}
+quests_folder = {"HandleId": h(), "Data": {
+    "$type": "gameJournalPrimaryFolderEntry",
+    "entries": [{"HandleId": h(), "Data": {
+        "$type": "gameJournalFolderEntry",
+        "entries": [quest],
+        "id": q["folder"],
+        "journalEntryOverrideDataList": [],
+    }}],
+    "id": "quests",
+    "journalEntryOverrideDataList": [],
+}}
+
 journal = {
     "Header": {"WKitJsonVersion": "0.0.9", "GameVersion": 2310, "DataType": "CR2W"},
     "Data": {"Version": 195, "BuildVersion": 0, "EmbeddedFiles": [], "RootChunk": {
@@ -71,7 +153,7 @@ journal = {
         "entry": {"HandleId": h(), "Data": {
             "$type": "gameJournalRootFolderEntry",
             "descriptor": {"DepotPath": {"$type": "ResourcePath", "$storage": "uint64", "$value": "0"}, "Flags": "Default"},
-            "entries": [{"HandleId": h(), "Data": {
+            "entries": [quests_folder, {"HandleId": h(), "Data": {
                 "$type": "gameJournalPrimaryFolderEntry",
                 "entries": [contact],
                 "id": "contacts",
@@ -83,7 +165,9 @@ journal = {
     }},
 }
 
-texts = [("conv_title", spec["conversation_title"])] + [("msg_" + m["id"], m["text"]) for m in spec["messages"]]
+texts = [("conv_title", spec["conversation_title"]),
+         ("quest_title", q["title"]), ("quest_description", q["description"]),
+         ("quest_objective", q["objective"])] + [("msg_" + m["id"], m["text"]) for m in spec["messages"]]
 locres = {
     "Header": {"WKitJsonVersion": "0.0.9", "GameVersion": 2310, "DataType": "CR2W"},
     "Data": {"Version": 195, "BuildVersion": 0, "EmbeddedFiles": [], "RootChunk": {

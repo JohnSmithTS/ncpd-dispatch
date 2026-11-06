@@ -13,6 +13,7 @@ A Cyberpunk 2077 mod (Cyber Engine Tweaks Lua + Codeware) that gives V an NCPD c
   - gang wars (two rival factions fighting each other)
   - NCPD backup officers at higher ranks
 - **Police cover:** the prevention system is switched off under the source `NCPDDispatch` while a scene is active. Heat is cleared when the call ends, and police are re-enabled at shutdown and on each session start.
+- **GPS to calls:** the archive also adds a Contract quest, "NCPD Dispatch", with the objective "Respond to the NCPD call" and a GPS-enabled map pin. It is modelled on the base game's NCPD activity `ma_pac_wwd_02`. During a call, the mod activates and tracks the objective, and moves its pin to the call with `MappinSystem.SetMappinPosition`. The pin uses the `Zzz06_NCPDGigVariant` icon. If the pin can't be found, a plain map pin is used instead.
 - **Phone texts:** dispatch, result, promotion and warning texts come from the base game's **NCPD Dispatcher** contact, in a conversation named "NCPD Dispatch" (`phone/`, 46 messages).
 - **Ranks:** Patrol Officer → Senior Officer (60) → Sergeant (150) → Detective (300) → Lieutenant (600).
 

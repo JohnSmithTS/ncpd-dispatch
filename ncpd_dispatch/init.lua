@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.5.0",
+    version = "0.6.0",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -36,6 +36,8 @@ local NCPD = {
         victimsEnabled = true,  -- civilians at the scene that suspects go after
         policeCover = true,     -- NCPD doesn't put a wanted level on V during a call
         phoneTexts = true,      -- real texts from the NCPD Dispatcher contact
+        gpsQuest = true,        -- tracked NCPD objective: GPS route to the call
+        ncpdIcon = true,        -- show the call pin with the NCPD icon
     },
 }
 
@@ -505,6 +507,97 @@ local function pickTarget()
     return Vector4.new(o.x + math.cos(a) * d, o.y + math.sin(a) * d, o.z, 1), "rough", veh
 end
 
+---------------------------------------------------------------- GPS objective
+
+-- A Contract quest "NCPD Dispatch" with one objective and a GPS map pin is
+-- merged into the journal by ncpd_dispatch.archive. During a call the mod
+-- activates and tracks the objective (so the game draws the GPS route) and
+-- moves its pin to the call. Without it, a plain map pin is used instead.
+local QUEST = "quests/minor_activities/ncpd_dispatch_call"
+local PHASE = QUEST .. "/call"
+local OBJ = PHASE .. "/respond"
+
+local function jstate(path, cls, state, notify)
+    local ok, r = pcall(function()
+        return Game.GetJournalManager():ChangeEntryState(path, cls, state, notify)
+    end)
+    return ok and r
+end
+
+local function questOff()
+    local Q = JournalNotifyOption.DoNotNotify
+    jstate(OBJ, "gameJournalQuestObjective", gameJournalEntryState.Inactive, Q)
+    jstate(PHASE, "gameJournalQuestPhase", gameJournalEntryState.Inactive, Q)
+    jstate(QUEST, "gameJournalQuest", gameJournalEntryState.Inactive, Q)
+end
+
+local function questStart(c)
+    if not NCPD.save.gpsQuest then return end
+    questOff()
+    local Q = JournalNotifyOption.DoNotNotify
+    local okQ = jstate(QUEST, "gameJournalQuest", gameJournalEntryState.Active, Q)
+    local okP = jstate(PHASE, "gameJournalQuestPhase", gameJournalEntryState.Active, Q)
+    local okO = jstate(OBJ, "gameJournalQuestObjective", gameJournalEntryState.Active, JournalNotifyOption.Notify)
+    local tracked = pcall(function()
+        local jm = Game.GetJournalManager()
+        jm:TrackEntry(jm:GetEntryByString(OBJ, "gameJournalQuestObjective"))
+    end)
+    c.questOn = true
+    c.pinTries = 0
+    log(("GPS objective: quest %s, phase %s, objective %s, tracked %s"):format(
+        tostring(okQ), tostring(okP), tostring(okO), tostring(tracked)))
+end
+
+-- Find the objective's map pin (it registers a moment after activation)
+-- and keep it on the call's current position.
+local function questPin(c)
+    if not c.questOn or c.pinFailed then return end
+    if not c.questPin then
+        c.pinTries = c.pinTries + 1
+        pcall(function()
+            local jm = Game.GetJournalManager()
+            local ph = jm:GetEntryByString(PHASE, "gameJournalQuestPhase")
+            local ob = jm:GetEntryByString(OBJ, "gameJournalQuestObjective")
+            local m = Game.GetMappinSystem():GetMappinFromObjective(ph, ob)
+            if m then c.questPin = m:GetNewMappinID() end
+        end)
+        if not c.questPin then
+            if c.pinTries >= 40 then   -- ~10 s at 4 checks a second
+                c.pinFailed = true
+                log("GPS objective pin not found; using a plain map pin")
+            end
+            return
+        end
+        log(("GPS objective pin found after %d checks"):format(c.pinTries))
+        if NCPD.save.ncpdIcon then
+            local ok = pcall(function()
+                Game.GetMappinSystem():ChangeMappinVariant(c.questPin, gamedataMappinVariant.Zzz06_NCPDGigVariant)
+            end)
+            log("NCPD icon " .. (ok and "set" or "failed"))
+        end
+        -- the plain pin is no longer needed
+        if c.mappin then
+            pcall(function() Game.GetMappinSystem():UnregisterMappin(c.mappin) end)
+            c.mappin = nil
+        end
+    end
+    if c.markPos and c.pinAt ~= c.markPos then
+        local ok = pcall(function() Game.GetMappinSystem():SetMappinPosition(c.questPin, c.markPos) end)
+        c.pinAt = c.markPos
+        if not ok then log("could not move GPS pin") end
+    end
+end
+
+local function questEnd(c, outcome)
+    if not c or not c.questOn then return end
+    local Q = JournalNotifyOption.DoNotNotify
+    jstate(OBJ, "gameJournalQuestObjective",
+        outcome == "cleared" and gameJournalEntryState.Succeeded or gameJournalEntryState.Failed, Q)
+    pcall(function() Game.GetJournalManager():UntrackEntry() end)
+    questOff()
+    c.questOn = false
+end
+
 ---------------------------------------------------------------- calls
 
 local function clearMappin()
@@ -632,6 +725,7 @@ local function endCall(outcome)
         log("call abandoned")
     end
     restorePolice(outcome)
+    questEnd(c, outcome)
     NCPD.call = nil
     NCPD.timer = 0
     -- leave bodies for a bit, then clean up
@@ -675,12 +769,15 @@ local function prepareCall()
 end
 
 local function setMappin(c, pos)
+    c.markPos = pos
+    if c.questPin then questPin(c); return end
     if c.mappin then pcall(function() Game.GetMappinSystem():UnregisterMappin(c.mappin) end) end
     c.mappin = nil
     pcall(function()
         local data = MappinData.new()
         data.mappinType = TweakDBID.new("Mappins.DefaultStaticMappin")
-        data.variant = gamedataMappinVariant.CustomPositionVariant
+        data.variant = NCPD.save.ncpdIcon and gamedataMappinVariant.Zzz06_NCPDGigVariant
+            or gamedataMappinVariant.CustomPositionVariant
         data.visibleThroughWalls = true
         c.mappin = Game.GetMappinSystem():RegisterMappin(data, pos)
     end)
@@ -699,6 +796,7 @@ local function dispatchCall(prep)
         started = NCPD.now, deadline = NCPD.now + 120 + dist / 6,
     }
     setMappin(c, target)
+    questStart(c)
     NCPD.call = c
     table.insert(NCPD.recent, { x = target.x, y = target.y })
     while #NCPD.recent > RECENT_KEEP do table.remove(NCPD.recent, 1) end
@@ -1031,12 +1129,13 @@ end
 
 local function updateCall()
     local c = NCPD.call
+    questPin(c)
     if c.state == "enroute" then
         local d = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.target)
         if d < 150 then
             if not spawnScene(c) then
                 log("no suspects spawned; call cancelled")
-                clearMappin(); NCPD.call = nil; NCPD.timer = 0
+                clearMappin(); questEnd(c, "cancelled"); NCPD.call = nil; NCPD.timer = 0
             end
         elseif NCPD.now > c.deadline then
             endCall("late")
@@ -1191,7 +1290,7 @@ registerForEvent("onUpdate", function(dt)
     -- after a load (or a crash mid-call) make sure our police switch is on
     if not NCPD.policeChecked then
         NCPD.policeChecked = true
-        if not NCPD.call then setPoliceActive(true) end
+        if not NCPD.call then setPoliceActive(true); questOff() end
     end
 
     -- say hello once per session if duty was left on
@@ -1295,6 +1394,8 @@ registerForEvent("onDraw", function()
         ImGui.SameLine()
         if ImGui.Button("Rebuild NPC pools") then buildPools() end
         ImGui.Separator()
+        s.gpsQuest = ImGui.Checkbox("GPS route to calls (NCPD objective)", s.gpsQuest)
+        s.ncpdIcon = ImGui.Checkbox("NCPD icon on the call marker", s.ncpdIcon)
         s.phoneTexts = ImGui.Checkbox("Texts from NCPD Dispatcher", s.phoneTexts)
         ImGui.SameLine()
         if ImGui.Button("Radio check") then NCPD.sendText("radio_check") end
