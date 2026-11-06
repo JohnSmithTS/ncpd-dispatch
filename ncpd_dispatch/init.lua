@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.8.3",
+    version = "0.8.4",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -48,7 +48,9 @@ local OFFER_TIMEOUT = 45        -- seconds to confirm or deny a call before it g
 local BOSS_MIN_REP = 30         -- rep needed before heavies can show up
 local BACKUP_MIN_REP = 150      -- Sergeant and up get NCPD backup
 local BOSS_PAY, BOSS_REP = 2500, 20
-local BOSS_GRACE = 180          -- seconds of no progress before a heavy "flees"
+local BOSS_GRACE = 90           -- seconds of no progress before a heavy "flees"
+local GONE_AFTER = 10           -- a suspect seen before and missing this long counts as down
+local STALL_HINT = 25           -- seconds of no progress before "N suspects left" hints start
 local WAR_EARLY_BONUS = 0.25    -- extra pay for reaching a gang war mid-fight
 
 local SAVE_FILE = "ncpd_save.json"
@@ -1599,7 +1601,20 @@ local function updateCall()
     for _, s in ipairs(c.suspects) do
         if not s.done then
             local npc = des:GetEntity(s.id)
+            if not npc and s.seen and Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 100 then
+                -- seen before, now gone from the world while V is at the
+                -- scene: killed out of sight or despawned; don't block the call
+                s.missingSince = s.missingSince or NCPD.now
+                if NCPD.now - s.missingSince > GONE_AFTER then
+                    s.done = true
+                    c.lastProgress = NCPD.now
+                    if s.boss then c.bossDown = true end
+                    log(("suspect %s gone from the world for %d s; counted as down"):format(s.record, GONE_AFTER))
+                end
+            end
             if npc then
+                s.seen, s.missingSince = true, nil
+                pcall(function() s.lastPos = npc:GetWorldPosition() end)
                 if not s.hostile then
                     if c.faction2 then s.hostile = makeWarFighter(npc) else s.hostile = makeHostile(npc) end
                     if not s.hostile then log("could not set hostility on " .. s.record) end
@@ -1613,7 +1628,7 @@ local function updateCall()
                 else
                     remaining = remaining + 1
                 end
-            else
+            elseif not s.done then
                 remaining = remaining + 1   -- not streamed in yet
             end
         end
@@ -1674,10 +1689,32 @@ local function updateCall()
 
     if remaining == 0 then endCall("cleared"); return end
 
+    -- stalled: tell V how many are left and where the nearest one is
+    if NCPD.now - c.lastProgress > STALL_HINT and NCPD.now - (c.hintAt or 0) > 30 then
+        c.hintAt = NCPD.now
+        local me = Game.GetPlayer():GetWorldPosition()
+        local nearest, nd, info = nil, nil, {}
+        for _, s in ipairs(c.suspects) do
+            if not s.done then
+                local npc = des:GetEntity(s.id)
+                local st = npc and "alive" or (s.seen and "missing" or "never loaded")
+                local d = s.lastPos and Vector4.Distance(me, s.lastPos)
+                table.insert(info, ("%s%s %s%s"):format(s.boss and "heavy " or "", (s.record:gsub("^Character%.", "")), st,
+                    d and (" %.0f m"):format(d) or ""))
+                if s.lastPos and (not nd or d < nd) then nearest, nd = s.lastPos, d end
+            end
+        end
+        if nearest then
+            local dir, dist = compass(me, nearest)
+            notify(("NCPD: %d suspect%s left. Nearest about %d m %s."):format(remaining, remaining > 1 and "s" or "", dist, dir), 5)
+        end
+        log(("stalled %.0f s, %d left: %s"):format(NCPD.now - c.lastProgress, remaining, table.concat(info, "; ")))
+    end
+
     -- Suspects V can't reach (stuck in geometry) shouldn't block the call:
     -- if V is at the scene, someone is already down, and nothing has
     -- changed for a minute, the rest "flee" and the call wraps up.
-    local here = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 60
+    local here = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 100
     local grace = 60
     for _, s in ipairs(c.suspects) do if s.boss and not s.done then grace = BOSS_GRACE end end
     if here and remaining < #c.suspects and NCPD.now - c.lastProgress > grace then
