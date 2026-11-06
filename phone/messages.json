@@ -103,6 +103,11 @@
       "text": "Scene's clear, but we've got runners. Half pay. Tighten it up next time."
     },
     {
+      "id": "result_void",
+      "delay": 1,
+      "text": "Disregard, V. We can't get you to that scene. Another unit's taking it."
+    },
+    {
       "id": "result_late",
       "delay": 1,
       "text": "Disregard, another unit took the call. Response time matters, V."

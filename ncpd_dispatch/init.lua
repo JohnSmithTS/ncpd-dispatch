@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.8.1",
+    version = "0.8.2",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -622,39 +622,30 @@ local function loadSites()
     NCPD.districtName = data.districts or {}
 end
 
-local STATE_NAMES = { "Undefined", "Inactive", "Active", "Succeeded", "Failed" }
-local function stateName(v)
-    for _, n in ipairs(STATE_NAMES) do
-        local ok, e = pcall(function() return EnumInt(gameJournalEntryState[n]) end)
-        if ok and e == v then return n end
+-- A site counts as cleared once the vanilla NCPD activity there is done:
+-- its quest sets a "..._finished" fact (names vary per site, so sites.json
+-- lists them). The map icon's journal state doesn't track this (it stays
+-- Active). Sites with no known fact count as uncleared.
+local function siteCleared(site)
+    for _, f in ipairs(site.facts or {}) do
+        local ok, v = pcall(function() return Game.GetQuestsSystem():GetFactStr(f) end)
+        if ok and v and v > 0 then return true end
     end
-    return tostring(v)
+    return false
 end
-
--- State of the vanilla NCPD activity at a site, from its map icon's journal
--- entry. Assumed: Succeeded = cleared (first runs log the spread to confirm).
-local function siteState(site)
-    local ok, v = pcall(function()
-        local jm = Game.GetJournalManager()
-        return EnumInt(jm:GetEntryState(jm:GetEntryByString(site.poi, "gameJournalPointOfInterestMappin")))
-    end)
-    return ok and stateName(v) or "unknown"
-end
-local function siteCleared(site) return siteState(site) == "Succeeded" end
 
 local function logSiteStates()
     if NCPD.siteStatesLogged or #NCPD.sites == 0 then return end
     NCPD.siteStatesLogged = true
-    local count = {}
+    local cleared, known = 0, 0
     for _, st in ipairs(NCPD.sites) do
-        local n = siteState(st)
-        count[n] = (count[n] or 0) + 1
+        if #(st.facts or {}) > 0 then known = known + 1 end
+        if siteCleared(st) then cleared = cleared + 1 end
     end
-    local parts = {}
-    for n, k in pairs(count) do table.insert(parts, n .. " " .. k) end
     local banned = 0
     for _ in pairs(NCPD.bannedSites) do banned = banned + 1 end
-    log(("%d call sites, vanilla NCPD states: %s; banned %d"):format(#NCPD.sites, table.concat(parts, ", "), banned))
+    log(("%d call sites: %d cleared in vanilla (%d have a known finished fact), banned %d"):format(
+        #NCPD.sites, cleared, known, banned))
 end
 
 local function isRecent(x, y)
@@ -982,6 +973,11 @@ local function endCall(outcome)
         if rankName() ~= before then text("promo_" .. rankSlug(rankName())) end
         log(("call cleared: pay %d rep %+d (nonlethal %d/%d, fled %d, heavy down %s, war early %s, civilians saved %d/%d)"):format(
             pay, rep, c.nonlethal, #c.suspects, c.fled, tostring(c.bossDown or false), tostring(c.warEarly or false), c.saved or 0, #(c.victims or {})))
+    elseif outcome == "void" then
+        -- not V's fault: no penalty, next call comes sooner
+        notify("NCPD: Disregard, another unit is closer to that scene.", 6)
+        text("result_void")
+        log("call voided: no walking route to the scene")
     elseif outcome == "late" then
         NCPD.save.rep = math.max(0, NCPD.save.rep - 2)
         writeSave()
@@ -1008,6 +1004,7 @@ local function endCall(outcome)
     questEnd(c, outcome)
     NCPD.call = nil
     NCPD.timer = 0
+    if outcome == "void" then NCPD.timer = math.max(0, NCPD.save.dispatchEvery - 60) end   -- a new call in about a minute
     -- leave bodies for a bit, then clean up
     NCPD.cleanupAt = NCPD.now + 60
 end
@@ -1180,8 +1177,9 @@ local function sceneCentre(c)
                 return sp, "at target" .. (checked and (", " .. c.pathInfo) or "")
             end
         end
-        if checked then
+        if checked and not c.site then
             -- the nearest learned spots around the target that V can walk to
+            -- (not for call sites: the quest pin can't follow the scene)
             local near = {}
             for _, p in ipairs(NCPD.spots) do
                 local d = math.sqrt((p.x - c.target.x) ^ 2 + (p.y - c.target.y) ^ 2)
@@ -1202,10 +1200,13 @@ local function sceneCentre(c)
         end
     end
     if checked then
+        -- V can't get there: the call is called off rather than moved next
+        -- to V, where nothing was checked either
         log("target unreachable: " .. table.concat(reasons, "; "))
         banTarget(c, "no walking route")
+        return nil, "unreachable"
     end
-    local p, how = pickScene()   -- last resort: a spot near V
+    local p, how = pickScene()   -- no route check available: a spot near V
     return p, "near V (" .. how .. ")"
 end
 
@@ -1268,6 +1269,7 @@ end
 
 local function spawnScene(c)
     local pos, how = sceneCentre(c)
+    if not pos then return false, how end
     local _, centred = spawnGroup(c.suspects, NCPD.pools[c.faction], pos, c.count, { side = 1 })
     local extra = ""
     if c.faction2 then
@@ -1566,7 +1568,10 @@ local function updateCall()
     if c.state == "enroute" then
         local d = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.target)
         if d < 150 then
-            if not spawnScene(c) then
+            local ok, why = spawnScene(c)
+            if not ok and why == "unreachable" then
+                endCall("void")
+            elseif not ok then
                 log("no suspects spawned; call cancelled")
                 clearMappin(); questEnd(c, "cancelled"); NCPD.call = nil; NCPD.timer = 0
             end

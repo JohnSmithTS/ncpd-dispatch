@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract the game's own NCPD "Assault in Progress" sites into sites.json.
+r"""Extract the game's own NCPD "Assault in Progress" sites into sites.json.
 
 These are the call locations: outdoor street-fight areas the game designed,
 spread over Night City and the Badlands. The result is committed, so normal
@@ -17,13 +17,23 @@ and, for the anchor check, basegame_3_nightcity.archive ->
   $WK unbundle "$G/archive/pc/ep1/ep1_1_nightcity.archive" -o x -w '*.poimappins'
   $WK unbundle "$G/archive/pc/ep1/ep1_2_gamedata.archive"  -o x -w '*.journal'
   $WK convert serialize <each file>
-  python3 -I extract_sites.py sites.json <poimappins.json> <journal.json> [<journal.json> ...]
+  python3 -I extract_sites.py sites.json <poimappins.json> <journal.json> [<journal.json> ...] \
+      [--phases <dir>]
+
+--phases: a folder of serialized open_world/minor_activities quest phases
+(unbundle -r '.*open_world.minor_activities.*\.questphase$' from
+basegame_4_gamedata, then ep1_2_gamedata into the same folder so PL's copies
+win, then convert serialize the folder). Each site gets the facts its phases
+set to mark the activity done ("<something>_finished"; the names vary, e.g.
+ma_dtn_01_finished, ma_kab_016_finished). The mod reads them with
+QuestsSystem.GetFactStr to tell cleared sites from uncleared ones.
 
 Each POI's cooked position is looked up by ArchiveXL's journal path hash:
 Murmur3-32 with seed 0x5EEDBA5E over the path, e.g.
 points_of_interest/minor_activities/ma_wat_kab_01.
 """
 import json
+import os
 import struct
 import sys
 
@@ -98,8 +108,49 @@ def variant(entry):
     return md.get("variant")
 
 
+def finished_facts(phase_dir):
+    """site id -> sorted list of facts its quest phases set to mark it done."""
+    facts = {}
+    for root, _, files in os.walk(phase_dir):
+        parts = root.replace("\\", "/").split("/")
+        for f in files:
+            if not f.endswith(".questphase.json"):
+                continue
+            found = set()
+            def walk(o):
+                if isinstance(o, dict):
+                    if (o.get("$type") == "questSetVar_NodeType"
+                            and str(o.get("factName", "")).endswith("_finished") and o.get("value", 0) >= 1):
+                        found.add(o["factName"])
+                    for v in o.values():
+                        walk(v)
+                elif isinstance(o, list):
+                    for v in o:
+                        walk(v)
+            walk(json.load(open(os.path.join(root, f))))
+            # the activity is named by its folder (.../<id or loc_id>/...) or,
+            # where the folder is named differently (ma_bls_ina_01 holding
+            # ma_bls_ina_se1_01_phase), by the file
+            stem = f[:-len(".questphase.json")]
+            for suffix in ("_questphase", "_phase", "_quest"):
+                if stem.endswith(suffix):
+                    stem = stem[:-len(suffix)]
+            for seg in parts + [stem]:
+                sid = seg[4:] if seg.startswith("loc_ma_") else seg
+                if sid.startswith("ma_"):
+                    facts.setdefault(sid, set()).update(found)
+    return {k: sorted(v) for k, v in facts.items()}
+
+
 def main():
-    out, poi_file, journals = sys.argv[1], sys.argv[2], sys.argv[3:]
+    args = sys.argv[1:]
+    phase_dir = None
+    if "--phases" in args:
+        i = args.index("--phases")
+        phase_dir = args[i + 1]
+        del args[i:i + 2]
+    out, poi_file, journals = args[0], args[1], args[2:]
+    facts = finished_facts(phase_dir) if phase_dir else {}
     cooked = json.load(open(poi_file))["Data"]["RootChunk"]["cookedData"]
     pos = {e["journalPathHash"]: e["position"] for e in cooked}
     sites, seen = [], set()
@@ -119,11 +170,16 @@ def main():
                 print("unknown district, skipped:", sid)
                 continue
             sites.append({"id": sid, "poi": path, "district": dist,
-                          "x": round(p["X"], 3), "y": round(p["Y"], 3), "z": round(p["Z"], 3)})
+                          "x": round(p["X"], 3), "y": round(p["Y"], 3), "z": round(p["Z"], 3),
+                          "facts": facts.get(sid, [])})
     sites.sort(key=lambda s: s["id"])
     json.dump({"anchor": ANCHOR, "districts": DISTRICTS, "sites": sites},
               open(out, "w"), indent=1)
-    print(f"{len(sites)} sites in {len({s['district'] for s in sites})} districts -> {out}")
+    print(f"{len(sites)} sites in {len({s['district'] for s in sites})} districts, "
+          f"{sum(1 for s in sites if s['facts'])} with a finished fact -> {out}")
+    missing = [s["id"] for s in sites if not s["facts"]]
+    if missing:
+        print("no finished fact (counted as uncleared):", ", ".join(missing))
 
 
 if __name__ == "__main__":
