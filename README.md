@@ -4,7 +4,7 @@ A Cyberpunk 2077 mod (Cyber Engine Tweaks Lua + Codeware) that gives V an NCPD c
 
 ## Features (v0.4.3)
 
-- **Phone dispatch:** ringing with the game's phone sounds, a caller-ID HUD panel, and dispatcher lines with direction and distance. Auto-answer, or answer/decline hotkeys.
+- **Phone dispatch:** ringing with the game's phone sounds, a caller-ID HUD panel, and dispatcher lines with direction and distance. Auto-answer, or answer/decline hotkeys. Answering offers the call: the dispatch text has two replies ("10-4, en route." / "Negative, can't take it."), and nothing goes on the map until the player confirms, by replying in the phone, with the answer/decline hotkeys, or with the overlay buttons. No reply within 45 s passes the call to another unit. The mod polls the reply entries: picking one sets it Succeeded and the other Inactive (`MessengerDialogViewController.ActivateReply`).
 - **Destinations:** 150–400 m away on foot, 400–1200 m in a vehicle. Suspects spawn when V is within 150 m. Each call has an arrival deadline.
 - **Learned street spots:** a walkable point near V is sampled every 20 s (at most one per 50 m cell) into `ncpd_spots.json`. These are used as destinations, and the last 6 are avoided.
 - **Scenes:**
@@ -13,8 +13,8 @@ A Cyberpunk 2077 mod (Cyber Engine Tweaks Lua + Codeware) that gives V an NCPD c
   - gang wars (two rival factions fighting each other)
   - NCPD backup officers at higher ranks
 - **Police cover:** the prevention system is switched off under the source `NCPDDispatch` while a scene is active. Heat is cleared when the call ends, and police are re-enabled at shutdown and on each session start.
-- **GPS to calls:** the archive also adds a Contract quest, "NCPD Dispatch", with the objective "Respond to the NCPD call" and a GPS-enabled map pin. It is modelled on the base game's NCPD activity `ma_pac_wwd_02`. During a call, the mod activates and tracks the objective, and moves its pin to the call with `MappinSystem.SetMappinPosition`. The pin uses the `Zzz06_NCPDGigVariant` icon. If the pin can't be found, a plain map pin is used instead.
-- **Phone texts:** dispatch, result, promotion and warning texts come from the base game's **NCPD Dispatcher** contact, in a conversation named "NCPD Dispatch" (`phone/`, 46 messages).
+- **GPS to calls:** the archive also adds a Contract quest, "NCPD Dispatch", with one objective per call type and gang, which names the call (e.g. "Respond: armed robbery, Animals", "Respond: gang war, Wraiths vs Valentinos"; 80 objectives, ids `respond_<type>_<gang>[_<rival>]`), each with a GPS-enabled map pin. It is modelled on the base game's NCPD activity `ma_pac_wwd_02`. During a call, the mod activates and tracks the matching objective, and moves its pin to the call with `MappinSystem.SetMappinPosition`. The pin uses the `Zzz06_NCPDGigVariant` icon. If the pin can't be found, a plain map pin is used instead.
+- **Phone texts:** dispatch, result, promotion and warning texts come from the base game's **NCPD Dispatcher** contact, in a conversation named "NCPD Dispatch" (`phone/`, 49 messages plus the reply choices).
 - **Ranks:** Patrol Officer → Senior Officer (60) → Sergeant (150) → Detective (300) → Lieutenant (600).
 
 ## Requirements

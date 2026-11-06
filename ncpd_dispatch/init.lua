@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.6.0",
+    version = "0.7.0",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -44,6 +44,7 @@ local NCPD = {
 local RING_AUTO_ANSWER = 4      -- seconds of ringing before auto-answer
 local RING_TIMEOUT = 20         -- seconds before an unanswered call is missed
 local MISSED_RETRY = 90         -- seconds until dispatch tries again
+local OFFER_TIMEOUT = 45        -- seconds to confirm or deny a call before it goes to another unit
 local BOSS_MIN_REP = 30         -- rep needed before heavies can show up
 local BACKUP_MIN_REP = 150      -- Sergeant and up get NCPD backup
 local BOSS_PAY, BOSS_REP = 2500, 20
@@ -288,6 +289,57 @@ local function text(id)
     if NCPD.save.phoneTexts then pcall(NCPD.sendText, id) end
 end
 
+-- Reply options under the dispatch text. Picking one in the phone sets it
+-- Succeeded and the other Inactive (MessengerDialogViewController.ActivateReply);
+-- the mod polls those states.
+local REPLY_GROUP = TEXT_CONV .. "/reply"
+local REPLY_CLASS = "gameJournalPhoneChoiceEntry"
+local REPLIES = { "accept", "decline" }
+
+local function jset(path, cls, state, notify)
+    local ok, r = pcall(function()
+        return Game.GetJournalManager():ChangeEntryState(path, cls, state, notify or JournalNotifyOption.DoNotNotify)
+    end)
+    return ok and r
+end
+
+local function repliesOff()
+    for _, r in ipairs(REPLIES) do jset(REPLY_GROUP .. "/" .. r, REPLY_CLASS, gameJournalEntryState.Inactive) end
+    jset(REPLY_GROUP, "gameJournalPhoneChoiceGroup", gameJournalEntryState.Inactive)
+end
+
+local function repliesOn()
+    repliesOff()
+    local jm = Game.GetJournalManager()
+    for _, r in ipairs(REPLIES) do
+        pcall(function() jm:SetEntryVisited(jm:GetEntryByString(REPLY_GROUP .. "/" .. r, REPLY_CLASS), false) end)
+    end
+    local g = jset(REPLY_GROUP, "gameJournalPhoneChoiceGroup", gameJournalEntryState.Active)
+    local a = jset(REPLY_GROUP .. "/accept", REPLY_CLASS, gameJournalEntryState.Active)
+    local d = jset(REPLY_GROUP .. "/decline", REPLY_CLASS, gameJournalEntryState.Active)
+    log(("replies on: group %s, accept %s, decline %s"):format(tostring(g), tostring(a), tostring(d)))
+end
+
+-- "accept", "decline" or nil while the player hasn't replied in the phone.
+local function pickedReply()
+    local jm = Game.GetJournalManager()
+    for _, r in ipairs(REPLIES) do
+        local ok, done = pcall(function()
+            local st = jm:GetEntryState(jm:GetEntryByString(REPLY_GROUP .. "/" .. r, REPLY_CLASS))
+            return EnumInt(st) == EnumInt(gameJournalEntryState.Succeeded)
+        end)
+        if ok and done then return r end
+    end
+end
+
+-- A reply made with a hotkey or the overlay shows in the phone thread too.
+local function markReply(r)
+    for _, x in ipairs(REPLIES) do
+        if x ~= r then jset(REPLY_GROUP .. "/" .. x, REPLY_CLASS, gameJournalEntryState.Inactive) end
+    end
+    jset(REPLY_GROUP .. "/" .. r, REPLY_CLASS, gameJournalEntryState.Succeeded)
+end
+
 local function rankSlug(name) return (name:lower():gsub(" ", "_")) end
 
 -- Show a line in the panel, or as an on-screen message if the panel failed.
@@ -515,7 +567,7 @@ end
 -- moves its pin to the call. Without it, a plain map pin is used instead.
 local QUEST = "quests/minor_activities/ncpd_dispatch_call"
 local PHASE = QUEST .. "/call"
-local OBJ = PHASE .. "/respond"
+local OBJ_CLASS = "gameJournalQuestObjective"
 
 local function jstate(path, cls, state, notify)
     local ok, r = pcall(function()
@@ -524,28 +576,53 @@ local function jstate(path, cls, state, notify)
     return ok and r
 end
 
-local function questOff()
+-- The archive has one objective per call type and gang (gang wars per gang
+-- pair) so the objective line names the call: respond_<type>_<gang>[_<rival>].
+local function objPath(c)
+    local id = "respond_" .. c.type.key .. "_" .. (GANG_SLUG[c.faction] or "")
+    if c.faction2 then id = id .. "_" .. (GANG_SLUG[c.faction2] or "") end
+    return PHASE .. "/" .. id
+end
+
+-- Turns the quest off. With no call, every objective is switched off (after
+-- a load we don't know which one a saved game left active).
+local function questOff(c)
     local Q = JournalNotifyOption.DoNotNotify
-    jstate(OBJ, "gameJournalQuestObjective", gameJournalEntryState.Inactive, Q)
+    if c and c.obj then
+        jstate(c.obj, OBJ_CLASS, gameJournalEntryState.Inactive, Q)
+    else
+        for _, t in ipairs(CALL_TYPES) do
+            for _, a in pairs(GANG_SLUG) do
+                if t.war then
+                    for _, b in pairs(GANG_SLUG) do
+                        if a ~= b then jstate(PHASE .. "/respond_war_" .. a .. "_" .. b, OBJ_CLASS, gameJournalEntryState.Inactive, Q) end
+                    end
+                else
+                    jstate(PHASE .. "/respond_" .. t.key .. "_" .. a, OBJ_CLASS, gameJournalEntryState.Inactive, Q)
+                end
+            end
+        end
+    end
     jstate(PHASE, "gameJournalQuestPhase", gameJournalEntryState.Inactive, Q)
     jstate(QUEST, "gameJournalQuest", gameJournalEntryState.Inactive, Q)
 end
 
 local function questStart(c)
     if not NCPD.save.gpsQuest then return end
-    questOff()
+    c.obj = objPath(c)
+    questOff(c)
     local Q = JournalNotifyOption.DoNotNotify
     local okQ = jstate(QUEST, "gameJournalQuest", gameJournalEntryState.Active, Q)
     local okP = jstate(PHASE, "gameJournalQuestPhase", gameJournalEntryState.Active, Q)
-    local okO = jstate(OBJ, "gameJournalQuestObjective", gameJournalEntryState.Active, JournalNotifyOption.Notify)
+    local okO = jstate(c.obj, OBJ_CLASS, gameJournalEntryState.Active, JournalNotifyOption.Notify)
     local tracked = pcall(function()
         local jm = Game.GetJournalManager()
-        jm:TrackEntry(jm:GetEntryByString(OBJ, "gameJournalQuestObjective"))
+        jm:TrackEntry(jm:GetEntryByString(c.obj, OBJ_CLASS))
     end)
     c.questOn = true
     c.pinTries = 0
-    log(("GPS objective: quest %s, phase %s, objective %s, tracked %s"):format(
-        tostring(okQ), tostring(okP), tostring(okO), tostring(tracked)))
+    log(("GPS objective %s: quest %s, phase %s, objective %s, tracked %s"):format(
+        c.obj:match("[^/]+$"), tostring(okQ), tostring(okP), tostring(okO), tostring(tracked)))
 end
 
 -- Find the objective's map pin (it registers a moment after activation)
@@ -557,7 +634,7 @@ local function questPin(c)
         pcall(function()
             local jm = Game.GetJournalManager()
             local ph = jm:GetEntryByString(PHASE, "gameJournalQuestPhase")
-            local ob = jm:GetEntryByString(OBJ, "gameJournalQuestObjective")
+            local ob = jm:GetEntryByString(c.obj, OBJ_CLASS)
             local m = Game.GetMappinSystem():GetMappinFromObjective(ph, ob)
             if m then c.questPin = m:GetNewMappinID() end
         end)
@@ -591,10 +668,10 @@ end
 local function questEnd(c, outcome)
     if not c or not c.questOn then return end
     local Q = JournalNotifyOption.DoNotNotify
-    jstate(OBJ, "gameJournalQuestObjective",
+    jstate(c.obj, OBJ_CLASS,
         outcome == "cleared" and gameJournalEntryState.Succeeded or gameJournalEntryState.Failed, Q)
     pcall(function() Game.GetJournalManager():UntrackEntry() end)
-    questOff()
+    questOff(c)
     c.questOn = false
 end
 
@@ -937,7 +1014,7 @@ end
 
 -- The phone rings; the call is answered automatically or with the hotkey.
 local function startCall()
-    if NCPD.call or NCPD.ring or NCPD.dialog then log("a call is already active or ringing"); return end
+    if NCPD.call or NCPD.ring or NCPD.dialog or NCPD.offer then log("a call is already active or ringing"); return end
     local prep = prepareCall()
     if not prep then return end
     NCPD.ring = { prep = prep, t = 0 }
@@ -947,6 +1024,8 @@ local function startCall()
     log("phone ringing: " .. prep.type.title .. " / " .. prep.faction)
 end
 
+-- Answering the call offers it: the dispatch text arrives with two replies.
+-- Nothing is put on the map until the player confirms.
 local function answerCall()
     local r = NCPD.ring
     if not r then return end
@@ -954,22 +1033,58 @@ local function answerCall()
     stopSound("ui_phone_incoming_call")
     sound("ui_phone_incoming_call_stop")
     sound("ui_phone_incoming_call_positive")
-    local pos = dispatchCall(r.prep)
-    if pos then
-        local slug = GANG_SLUG[r.prep.faction]
-        if slug and r.prep.type.key then text(r.prep.type.key .. "_" .. slug) end
+    local prep = r.prep
+    NCPD.offer = { prep = prep, t = 0, poll = 0 }
+    local slug = GANG_SLUG[prep.faction]
+    local phone = NCPD.save.phoneTexts and slug and prep.type.key
+    if phone then
+        pcall(repliesOn)
+        text(prep.type.key .. "_" .. slug)
     end
+    local what = prep.faction2 and (prep.faction .. " vs " .. prep.faction2) or prep.faction
+    say("NCPD DISPATCH", ("%s, %s.\nCan you take it? %s"):format(prep.type.title, what,
+        phone and "Reply by text or use your NCPD keys." or "Use your NCPD answer / decline keys."), OFFER_TIMEOUT)
+    log("call offered: " .. prep.type.title .. " / " .. what)
+end
+
+-- how: "phone" (reply picked in the phone), "key" (hotkey or overlay), "timeout"
+local function resolveOffer(accept, how)
+    local o = NCPD.offer
+    if not o then return end
+    NCPD.offer = nil
+    if NCPD.save.phoneTexts then
+        if how == "timeout" then pcall(repliesOff)
+        elseif how == "key" then pcall(markReply, accept and "accept" or "decline") end
+    end
+    if not accept then
+        if how == "timeout" then
+            text("offer_timeout")
+            say("NO REPLY", "NCPD Dispatch\nThe call went to another unit.", 5, RED)
+            NCPD.timer = math.max(0, NCPD.save.dispatchEvery - MISSED_RETRY)
+            log("call not confirmed in time")
+        else
+            text("deny_ack")
+            say("CALL DECLINED", "NCPD Dispatch\nPassed to another unit.", 4, RED)
+            NCPD.timer = 0
+            log("call declined (" .. how .. ")")
+        end
+        NCPD.dialog = { lines = {}, t = 0, i = 0, hold = 4 }
+        return
+    end
+    log("call confirmed (" .. how .. ")")
+    local pos = dispatchCall(o.prep)
     if not pos then
         say("NCPD DISPATCH", "Disregard, unit. Situation resolved.", 5)
         NCPD.dialog = { lines = { }, t = 0, i = 0, hold = 4 }
         return
     end
+    text("confirm_ack")
     local dir, dist = compass(Game.GetPlayer():GetWorldPosition(), pos)
     local c = NCPD.call
     NCPD.dialog = {
         t = 0, i = 0,
         lines = {
-            ("%s V, this is NCPD Dispatch. You're the closest unit."):format(rankName()),
+            ("Copy that, %s V. You're the closest unit."):format(rankName()),
             ("We have a %s about %d meters %s of you."):format(c.type.title:lower(), dist, dir),
             c.faction2 and ("%s and %s are shooting it out, %d on %d. Let them thin each other out if you like."):format(
                 c.faction, c.faction2, c.count, c.count2)
@@ -996,6 +1111,19 @@ local function declineCall(missed)
         log("call declined")
     end
     NCPD.dialog = { lines = {}, t = 0, i = 0, hold = 4 }
+end
+
+local function updateOffer(dt)
+    local o = NCPD.offer
+    o.t = o.t + dt
+    o.poll = o.poll + dt
+    if o.poll < 0.25 then return end
+    o.poll = 0
+    if NCPD.save.phoneTexts then
+        local r = pickedReply()
+        if r then resolveOffer(r == "accept", "phone"); return end
+    end
+    if o.t >= OFFER_TIMEOUT then resolveOffer(false, "timeout") end
 end
 
 local function updateRing(dt)
@@ -1257,6 +1385,7 @@ registerForEvent("onInit", function()
 end)
 
 registerForEvent("onShutdown", function()
+    if NCPD.offer then pcall(repliesOff) end
     restorePolice("shutdown")
     stopSound("ui_phone_incoming_call")
     hidePanel()
@@ -1280,8 +1409,12 @@ registerHotkey("ncpd_duty", "Toggle NCPD duty", function()
 end)
 
 registerHotkey("ncpd_call", "Request NCPD call now", function() startCall() end)
-registerHotkey("ncpd_answer", "Answer NCPD call", function() answerCall() end)
-registerHotkey("ncpd_decline", "Decline NCPD call", function() declineCall(false) end)
+registerHotkey("ncpd_answer", "Answer / confirm NCPD call", function()
+    if NCPD.offer then resolveOffer(true, "key") else answerCall() end
+end)
+registerHotkey("ncpd_decline", "Decline NCPD call", function()
+    if NCPD.offer then resolveOffer(false, "key") else declineCall(false) end
+end)
 
 registerForEvent("onUpdate", function(dt)
     NCPD.now = NCPD.now + dt
@@ -1290,7 +1423,7 @@ registerForEvent("onUpdate", function(dt)
     -- after a load (or a crash mid-call) make sure our police switch is on
     if not NCPD.policeChecked then
         NCPD.policeChecked = true
-        if not NCPD.call then setPoliceActive(true); questOff() end
+        if not NCPD.call then setPoliceActive(true); questOff(); pcall(repliesOff) end
     end
 
     -- say hello once per session if duty was left on
@@ -1316,6 +1449,10 @@ registerForEvent("onUpdate", function(dt)
         local ok, err = pcall(updateRing, dt)
         if not ok then log("ring error: " .. tostring(err)); NCPD.ring = nil end
     end
+    if NCPD.offer then
+        local ok, err = pcall(updateOffer, dt)
+        if not ok then log("offer error: " .. tostring(err)); NCPD.offer = nil; hidePanel() end
+    end
     if NCPD.dialog then
         local ok, err = pcall(updateDialog, dt)
         if not ok then log("dialog error: " .. tostring(err)); NCPD.dialog = nil; hidePanel() end
@@ -1329,7 +1466,7 @@ registerForEvent("onUpdate", function(dt)
             local ok, err = pcall(updateCall)
             if not ok then log("update error: " .. tostring(err)) end
         end
-    elseif NCPD.save.onDuty and NCPD.save.autoDispatch and not NCPD.ring and not NCPD.dialog then
+    elseif NCPD.save.onDuty and NCPD.save.autoDispatch and not NCPD.ring and not NCPD.dialog and not NCPD.offer then
         NCPD.timer = NCPD.timer + dt
         if NCPD.timer >= NCPD.save.dispatchEvery then
             if inCombat() then
@@ -1377,6 +1514,13 @@ registerForEvent("onDraw", function()
             if ImGui.Button("Answer") then answerCall() end
             ImGui.SameLine()
             if ImGui.Button("Decline") then declineCall(false) end
+        elseif NCPD.offer then
+            local p = NCPD.offer.prep
+            ImGui.Text(("Call offered: %s (%s), %d s to reply"):format(p.type.title, p.faction,
+                math.max(0, math.floor(OFFER_TIMEOUT - NCPD.offer.t))))
+            if ImGui.Button("Confirm") then resolveOffer(true, "key") end
+            ImGui.SameLine()
+            if ImGui.Button("Deny") then resolveOffer(false, "key") end
         elseif NCPD.call then
             local c, left = NCPD.call, 0
             for _, x in ipairs(c.suspects) do if not x.done then left = left + 1 end end

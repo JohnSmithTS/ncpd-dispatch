@@ -44,9 +44,29 @@ def message(m):
         "text": loc("msg_" + m["id"]),
     }}
 
+# Player replies: picking one in the phone sets it Succeeded and the others
+# Inactive (MessengerDialogViewController.ActivateReply); the mod polls that.
+replies = spec.get("replies")
+def choice(c):
+    return {"HandleId": h(), "Data": {
+        "$type": "gameJournalPhoneChoiceEntry",
+        "id": c["id"],
+        "isQuestImportant": 1,
+        "journalEntryOverrideDataList": [],
+        "questCondition": None,
+        "text": loc("reply_" + c["id"]),
+    }}
+conv_entries = [message(m) for m in spec["messages"]]
+if replies:
+    conv_entries.append({"HandleId": h(), "Data": {
+        "$type": "gameJournalPhoneChoiceGroup",
+        "entries": [choice(c) for c in replies["choices"]],
+        "id": replies["group"],
+        "journalEntryOverrideDataList": [],
+    }})
 conversation = {"HandleId": h(), "Data": {
     "$type": "gameJournalPhoneConversation",
-    "entries": [message(m) for m in spec["messages"]],
+    "entries": conv_entries,
     "id": spec["conversation"],
     "journalEntryOverrideDataList": [],
     "title": loc("conv_title"),
@@ -67,10 +87,26 @@ def ref_none(kind, storage="string", value="None"):
     return {"$type": kind, "$storage": storage, "$value": value}
 
 q = spec["quest"]
-objective = {"HandleId": h(), "Data": {
+# One objective per call type and gang (gang wars: per gang pair), so the
+# objective line names the call; the mod activates the matching one.
+# Ids: respond_<type>_<gang>[_<rival>]
+gangs = spec["gangs"]
+objectives = []   # (id, text)
+for key, tmpl in q["objectives"].items():
+    for slug, name in gangs.items():
+        if "{Rival}" in tmpl:
+            for slug2, name2 in gangs.items():
+                if slug2 != slug:
+                    objectives.append((f"respond_{key}_{slug}_{slug2}",
+                                       tmpl.replace("{Gang}", name).replace("{Rival}", name2)))
+        else:
+            objectives.append((f"respond_{key}_{slug}", tmpl.replace("{Gang}", name)))
+
+def make_objective(oid):
+    return {"HandleId": h(), "Data": {
     "$type": "gameJournalQuestObjective",
     "counter": 0,
-    "description": loc("quest_objective"),
+    "description": loc("quest_obj_" + oid),
     "districtID": "",
     "entries": [{"HandleId": h(), "Data": {
         "$type": "gameJournalQuestMapPin",
@@ -103,12 +139,12 @@ objective = {"HandleId": h(), "Data": {
         "slotName": ref_none("CName"),
         "uiAnimation": ref_none("TweakDBID", "uint64", "0"),
     }}],
-    "id": "respond",
+    "id": oid,
     "itemID": ref_none("TweakDBID", "uint64", "0"),
     "journalEntryOverrideDataList": [],
     "locationPrefabRef": ref_none("NodeRef", "uint64", "0"),
     "optional": 0,
-}}
+    }}
 quest = {"HandleId": h(), "Data": {
     "$type": "gameJournalQuest",
     "districtID": "",
@@ -121,7 +157,7 @@ quest = {"HandleId": h(), "Data": {
         }},
         {"HandleId": h(), "Data": {
             "$type": "gameJournalQuestPhase",
-            "entries": [objective],
+            "entries": [make_objective(oid) for oid, _ in objectives],
             "id": "call",
             "journalEntryOverrideDataList": [],
             "locationPrefabRef": ref_none("NodeRef", "uint64", "0"),
@@ -165,9 +201,13 @@ journal = {
     }},
 }
 
-texts = [("conv_title", spec["conversation_title"]),
-         ("quest_title", q["title"]), ("quest_description", q["description"]),
-         ("quest_objective", q["objective"])] + [("msg_" + m["id"], m["text"]) for m in spec["messages"]]
+texts = ([("conv_title", spec["conversation_title"]),
+          ("quest_title", q["title"]), ("quest_description", q["description"])]
+         + [("quest_obj_" + oid, t) for oid, t in objectives]
+         + [("reply_" + c["id"], c["text"]) for c in (replies or {}).get("choices", [])]
+         + [("msg_" + m["id"], m["text"]) for m in spec["messages"]])
+keys = [k for k, _ in texts]
+assert len(keys) == len(set(keys)), "duplicate localization keys"
 locres = {
     "Header": {"WKitJsonVersion": "0.0.9", "GameVersion": 2310, "DataType": "CR2W"},
     "Data": {"Version": 195, "BuildVersion": 0, "EmbeddedFiles": [], "RootChunk": {
@@ -187,4 +227,4 @@ os.makedirs(os.path.join(base, "journal"), exist_ok=True)
 os.makedirs(os.path.join(base, "localization"), exist_ok=True)
 json.dump(journal, open(os.path.join(base, "journal", "ncpd_dispatch.journal.json"), "w"), indent=1)
 json.dump(locres, open(os.path.join(base, "localization", "en-us.json.json"), "w"), indent=1)
-print(f"{len(spec['messages'])} messages, {len(texts)} texts")
+print(f"{len(spec['messages'])} messages, {len(objectives)} objectives, {len(texts)} texts")

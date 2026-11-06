@@ -14,7 +14,12 @@
     ],
     "title": "NCPD Dispatch",
     "description": "Dispatch has a crime in progress for you. Get to the scene, deal with the suspects and keep the civilians alive.",
-    "objective": "Respond to the NCPD call"
+    "objectives": {
+      "robbery": "Respond: armed robbery, {Gang}",
+      "assault": "Respond: gang assault, {Gang}",
+      "shots": "Respond: shots fired, {Gang}",
+      "war": "Respond: gang war, {Gang} vs {Rival}"
+    }
   },
   "gangs": {
     "maelstrom": "Maelstrom",
@@ -29,19 +34,19 @@
   "templates": [
     {
       "id": "robbery_{gang}",
-      "text": "10-31, armed robbery in progress. Suspects are {Gang}, civilians on scene. Location's on your map, respond code 3."
+      "text": "10-31, armed robbery in progress. Suspects are {Gang}, civilians on scene. Can you take it?"
     },
     {
       "id": "assault_{gang}",
-      "text": "10-34, assault in progress. A {Gang} crew is working someone over. Marker sent, get there before it turns into a homicide."
+      "text": "10-34, assault in progress. A {Gang} crew is working someone over. Can you take it?"
     },
     {
       "id": "shots_{gang}",
-      "text": "10-71, shots fired, multiple suspects. Witnesses ID them as {Gang}. Expect resistance. Location on your map."
+      "text": "10-71, shots fired, multiple suspects. Witnesses ID them as {Gang}. Expect resistance. Can you take it?"
     },
     {
       "id": "war_{gang}",
-      "text": "All units: {Gang} and a rival crew are shooting it out in the street. You're closest. Let them thin each other out, then shut it down."
+      "text": "All units: {Gang} and a rival crew are shooting it out in the street. You're closest. Can you take it?"
     }
   ],
   "messages": [
@@ -59,6 +64,21 @@
       "id": "missed_call",
       "delay": 1,
       "text": "Dispatch tried your line. Pick up next time, we'll call back shortly."
+    },
+    {
+      "id": "confirm_ack",
+      "delay": 1,
+      "text": "Copy. Location's on your map, respond code 3."
+    },
+    {
+      "id": "deny_ack",
+      "delay": 1,
+      "text": "Copy, passing it to another unit."
+    },
+    {
+      "id": "offer_timeout",
+      "delay": 1,
+      "text": "No answer, V. Passing it to another unit."
     },
     {
       "id": "heavy_warning",
@@ -115,5 +135,18 @@
       "delay": 4,
       "text": "Lieutenant. The precinct is proud of you. Night City still needs you out there."
     }
-  ]
+  ],
+  "replies": {
+    "group": "reply",
+    "choices": [
+      {
+        "id": "accept",
+        "text": "10-4, en route."
+      },
+      {
+        "id": "decline",
+        "text": "Negative, can't take it."
+      }
+    ]
+  }
 }
