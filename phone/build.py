@@ -104,9 +104,11 @@ for key, tmpl in q["objectives"].items():
 
 # Call sites: the game's own "Assault in Progress" locations (sites.json,
 # made by extract_sites.py). One objective per district, "Get to the scene:
-# <district>", holds one map pin per site there; the mod activates the pin of
-# the call's site and tracks that objective (GPS + distance). The named
-# objective above has no pin; the tracker lists both active objectives.
+# <district>", per site: scene_<site id> holds that site's one map pin.
+# (Activating an objective spawns every pin under it, so one objective per
+# district showed all its sites at once.) The mod activates the call's scene
+# objective and tracks it (GPS + distance). The named objective above has no
+# pin; the tracker lists both active objectives.
 sites_spec = json.load(open(os.path.join(os.path.dirname(os.path.abspath(src)), "sites.json")))
 anchor = sites_spec["anchor"]
 districts = sites_spec["districts"]
@@ -114,11 +116,11 @@ by_district = {}
 for st in sites_spec["sites"]:
     by_district.setdefault(st["district"], []).append(st)
 
-def empty_objective(oid, entries=()):
+def empty_objective(oid, entries=(), text_key=None):
     return {"HandleId": h(), "Data": {
         "$type": "gameJournalQuestObjective",
         "counter": 0,
-        "description": loc("quest_obj_" + oid),
+        "description": loc("quest_obj_" + (text_key or oid)),
         "districtID": "",
         "entries": list(entries),
         "id": oid,
@@ -165,9 +167,8 @@ def site_pin(st):
         "uiAnimation": ref_none("TweakDBID", "uint64", "0"),
     }}
 
-scene_objectives = []   # (id, text)
-for d in sorted(by_district):
-    scene_objectives.append(("scene_" + d, q["scene_objective"].replace("{District}", districts[d])))
+# texts are per district: quest_obj_scene_<district>
+scene_texts = [("scene_" + d, q["scene_objective"].replace("{District}", districts[d])) for d in sorted(by_district)]
 
 quest = {"HandleId": h(), "Data": {
     "$type": "gameJournalQuest",
@@ -182,8 +183,8 @@ quest = {"HandleId": h(), "Data": {
         {"HandleId": h(), "Data": {
             "$type": "gameJournalQuestPhase",
             "entries": [empty_objective(oid) for oid, _ in objectives]
-                     + [empty_objective(oid, [site_pin(st) for st in by_district[oid[6:]]])
-                        for oid, _ in scene_objectives],
+                     + [empty_objective("scene_" + st["id"], [site_pin(st)], "scene_" + st["district"])
+                        for st in sites_spec["sites"]],
             "id": "call",
             "journalEntryOverrideDataList": [],
             "locationPrefabRef": ref_none("NodeRef", "uint64", "0"),
@@ -229,7 +230,7 @@ journal = {
 
 texts = ([("conv_title", spec["conversation_title"]),
           ("quest_title", q["title"]), ("quest_description", q["description"])]
-         + [("quest_obj_" + oid, t) for oid, t in objectives + scene_objectives]
+         + [("quest_obj_" + oid, t) for oid, t in objectives + scene_texts]
          + [("pin_" + d, q["pin_caption"].replace("{District}", districts[d])) for d in sorted(by_district)]
          + [("reply_" + c["id"], c["text"]) for c in (replies or {}).get("choices", [])]
          + [("msg_" + m["id"], m["text"]) for m in spec["messages"]])
@@ -255,4 +256,4 @@ os.makedirs(os.path.join(base, "localization"), exist_ok=True)
 json.dump(journal, open(os.path.join(base, "journal", "ncpd_dispatch.journal.json"), "w"), indent=1)
 json.dump(locres, open(os.path.join(base, "localization", "en-us.json.json"), "w"), indent=1)
 print(f"{len(spec['messages'])} messages, {len(objectives)} call objectives, "
-      f"{len(scene_objectives)} scene objectives, {len(sites_spec['sites'])} site pins, {len(texts)} texts")
+      f"{len(sites_spec['sites'])} scene objectives with one pin each, {len(texts)} texts")

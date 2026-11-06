@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.8.0",
+    version = "0.8.1",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -742,8 +742,9 @@ end
 
 -- The archive has one objective per call type and gang (gang wars per gang
 -- pair) that names the call, respond_<type>_<gang>[_<rival>], without a pin;
--- and one objective per district, scene_<district> ("Get to the scene:
--- Kabuki"), holding a map pin per call site, site_<id>. A pin's position is
+-- and one objective per call site, scene_<site id> ("Get to the scene:
+-- Kabuki"), holding that site's map pin, site_<site id>. (An active objective
+-- shows every pin under it, so each site needs its own objective.) A pin's position is
 -- fixed in the archive (it can't be moved at runtime), so calls go to those
 -- sites. The tracker lists both active objectives; the scene one is tracked
 -- for GPS and distance.
@@ -776,7 +777,7 @@ local function questOff(c)
                 end
             end
         end
-        for d in pairs(NCPD.districtName) do jstate(PHASE .. "/scene_" .. d, OBJ_CLASS, off, Q) end
+        for _, st in ipairs(NCPD.sites) do jstate(PHASE .. "/scene_" .. st.id, OBJ_CLASS, off, Q) end
     end
     jstate(PHASE, "gameJournalQuestPhase", off, Q)
     jstate(QUEST, "gameJournalQuest", off, Q)
@@ -786,7 +787,7 @@ local function questStart(c)
     if not NCPD.save.gpsQuest then return end
     c.obj = objPath(c)
     if c.site then
-        c.sceneObj = PHASE .. "/scene_" .. c.site.district
+        c.sceneObj = PHASE .. "/scene_" .. c.site.id
         c.pinPath = c.sceneObj .. "/site_" .. c.site.id
     end
     questOff(c)
