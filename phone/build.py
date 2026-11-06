@@ -103,12 +103,12 @@ for key, tmpl in q["objectives"].items():
             objectives.append((f"respond_{key}_{slug}", tmpl.replace("{Gang}", name)))
 
 # Call sites: the game's own "Assault in Progress" locations (sites.json,
-# made by extract_sites.py). One objective per district, "Get to the scene:
-# <district>", per site: scene_<site id> holds that site's one map pin.
-# (Activating an objective spawns every pin under it, so one objective per
-# district showed all its sites at once.) The mod activates the call's scene
-# objective and tracks it (GPS + distance). The named objective above has no
-# pin; the tracker lists both active objectives.
+# made by extract_sites.py). One objective per site, scene_<site id>, holding
+# just that site's map pin; its text is shared per district ("Get to the
+# scene: <district>"). Activating an objective spawns every pin under it, so
+# sites can't share one. The mod activates the call's scene objective and
+# tracks it (GPS + distance). The named objective above has no pin; the
+# tracker lists both active objectives.
 sites_spec = json.load(open(os.path.join(os.path.dirname(os.path.abspath(src)), "sites.json")))
 anchor = sites_spec["anchor"]
 districts = sites_spec["districts"]

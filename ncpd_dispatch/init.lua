@@ -1,11 +1,11 @@
--- NCPD Dispatch: an NCPD career for V.
--- v0.2: dispatch calls arrive by phone (ring, dispatcher lines); on-duty toggle and settings remembered; generated "crime in progress" calls built
--- from the game's own gang NPC records, map marker, payout, reputation, ranks.
--- v0.4: surprise heavies, gang wars between two factions, NCPD backup.
--- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
+-- NCPD Dispatch: NCPD hires V for crimes in progress at the game's own
+-- "Assault in Progress" sites. Calls come in by phone; V gets paid and builds
+-- standing with the precinct. History: CHANGELOG.md.
+-- Needs Cyber Engine Tweaks, Codeware (DynamicEntitySystem) and ArchiveXL
+-- (phone texts, quest objectives and map pins in ncpd_dispatch.archive).
 
 local NCPD = {
-    version = "0.9.1",
+    version = "0.9.2",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -203,9 +203,9 @@ function NCPD.sendText(msgId)
         local ok, r = pcall(function() return jm:ChangeEntryState(st[1], st[2], st[3], st[4]) end)
         results[i] = ok and tostring(r) or ("error " .. tostring(r))
     end
-    local found = pcall(function() return jm:GetEntryByString(path, "gameJournalPhoneMessage") end)
-    log(("text %s: contact %s, conversation %s, reset %s, send %s (entry lookup %s)"):format(
-        msgId, results[1], results[2], results[3], results[4], found and "ok" or "failed"))
+    local ok, entry = pcall(function() return jm:GetEntryByString(path, "gameJournalPhoneMessage") end)
+    log(("text %s: contact %s, conversation %s, reset %s, send %s (entry %s)"):format(
+        msgId, results[1], results[2], results[3], results[4], (ok and entry) and "found" or "not found"))
 end
 
 -- Message ids in phone/messages.json use these gang slugs.
@@ -226,7 +226,8 @@ local REPLY_GROUP = TEXT_CONV .. "/reply"
 local REPLY_CLASS = "gameJournalPhoneChoiceEntry"
 local REPLIES = { "accept", "decline" }
 
-local function jset(path, cls, state, notify)
+-- Set a journal entry's state; returns the game's result, or false on error.
+local function jstate(path, cls, state, notify)
     local ok, r = pcall(function()
         return Game.GetJournalManager():ChangeEntryState(path, cls, state, notify or JournalNotifyOption.DoNotNotify)
     end)
@@ -234,8 +235,8 @@ local function jset(path, cls, state, notify)
 end
 
 local function repliesOff()
-    for _, r in ipairs(REPLIES) do jset(REPLY_GROUP .. "/" .. r, REPLY_CLASS, gameJournalEntryState.Inactive) end
-    jset(REPLY_GROUP, "gameJournalPhoneChoiceGroup", gameJournalEntryState.Inactive)
+    for _, r in ipairs(REPLIES) do jstate(REPLY_GROUP .. "/" .. r, REPLY_CLASS, gameJournalEntryState.Inactive) end
+    jstate(REPLY_GROUP, "gameJournalPhoneChoiceGroup", gameJournalEntryState.Inactive)
 end
 
 local function repliesOn()
@@ -244,9 +245,9 @@ local function repliesOn()
     for _, r in ipairs(REPLIES) do
         pcall(function() jm:SetEntryVisited(jm:GetEntryByString(REPLY_GROUP .. "/" .. r, REPLY_CLASS), false) end)
     end
-    local g = jset(REPLY_GROUP, "gameJournalPhoneChoiceGroup", gameJournalEntryState.Active)
-    local a = jset(REPLY_GROUP .. "/accept", REPLY_CLASS, gameJournalEntryState.Active)
-    local d = jset(REPLY_GROUP .. "/decline", REPLY_CLASS, gameJournalEntryState.Active)
+    local g = jstate(REPLY_GROUP, "gameJournalPhoneChoiceGroup", gameJournalEntryState.Active)
+    local a = jstate(REPLY_GROUP .. "/accept", REPLY_CLASS, gameJournalEntryState.Active)
+    local d = jstate(REPLY_GROUP .. "/decline", REPLY_CLASS, gameJournalEntryState.Active)
     log(("replies on: group %s, accept %s, decline %s"):format(tostring(g), tostring(a), tostring(d)))
 end
 
@@ -265,17 +266,15 @@ end
 -- A reply made with a hotkey or the overlay shows in the phone thread too.
 local function markReply(r)
     for _, x in ipairs(REPLIES) do
-        if x ~= r then jset(REPLY_GROUP .. "/" .. x, REPLY_CLASS, gameJournalEntryState.Inactive) end
+        if x ~= r then jstate(REPLY_GROUP .. "/" .. x, REPLY_CLASS, gameJournalEntryState.Inactive) end
     end
-    jset(REPLY_GROUP .. "/" .. r, REPLY_CLASS, gameJournalEntryState.Succeeded)
+    jstate(REPLY_GROUP .. "/" .. r, REPLY_CLASS, gameJournalEntryState.Succeeded)
 end
 
 local function rankSlug(name) return (name:lower():gsub("[^%w]+", "_")) end
 
 -- Dispatcher status line. With phone texts on, lines the phone already
 -- shows (phoneToo) are skipped; the rest use the game's own on-screen message.
--- (v0.2-0.8.4 drew a caller-ID panel on the HUD; it didn't scale with the
--- UI and is redundant now that dispatch uses the phone.)
 local function say(title, body, seconds, phoneToo)
     if phoneToo and NCPD.save.phoneTexts then return end
     notify(title .. ": " .. (body:gsub("\n", " - ")), seconds)
@@ -347,34 +346,39 @@ end
 
 ---------------------------------------------------------------- locations
 
--- Pick a point 60-120 m from the player and snap it to the human navmesh,
--- so suspects stand on walkable ground. Falls back to a closer raw offset.
+-- The navmesh only exists near V. (GetAINavigationSystem didn't work for
+-- these queries; GetNavigationSystem does.)
+local function navSystem()
+    if not NCPD.nav then pcall(function() NCPD.nav = Game.GetNavigationSystem() end) end
+    return NCPD.nav
+end
+
+-- Nearest walkable (human navmesh) point below `p`, searching `radius` m
+-- sideways and `depth` m down. With `refZ`, the point must be within `maxDz`
+-- m of that height (same floor). Returns nil if there is none.
+local function snap(p, radius, depth, refZ, maxDz)
+    local nav = navSystem()
+    if not nav then return nil end
+    local ok, sp = pcall(function() return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, radius, depth) end)
+    if not ok or not sp or (sp.x == 0 and sp.y == 0) then return nil end
+    if refZ and math.abs(sp.z - refZ) >= maxDz then return nil end
+    return sp
+end
+
+-- A walkable point 30-120 m from V on V's level, else 30 m ahead of V.
+-- Only used when the call's target can't be placed or checked.
 local function pickScene()
     local player = Game.GetPlayer()
     local origin = player:GetWorldPosition()
-    local systems = {}
-    pcall(function() table.insert(systems, { "AINav", Game.GetAINavigationSystem() }) end)
-    pcall(function() table.insert(systems, { "Nav", Game.GetNavigationSystem() }) end)
-    local why = {}
     for try = 1, 16 do
         local ang = math.random() * math.pi * 2
         local dist = 60 + math.random() * 60
         if try > 8 then dist = 30 + math.random() * 30 end   -- closer if far points fail
         local p = Vector4.new(origin.x + math.cos(ang) * dist, origin.y + math.sin(ang) * dist, origin.z + 4, 1)
-        for _, s in ipairs(systems) do
-            local ok, snapped = pcall(function()
-                return s[2]:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, 3.0, 8)
-            end)
-            if ok and snapped and (snapped.x ~= 0 or snapped.y ~= 0)
-                and math.abs(snapped.z - origin.z) < 6 then   -- same level as V, not an upper floor
-                NCPD.nav = s[2]
-                return snapped, "navmesh/" .. s[1]
-            end
-            why[s[1]] = ok and ("returned " .. (snapped and ("%.0f %.0f %.0f"):format(snapped.x, snapped.y, snapped.z) or "nil"))
-                or ("error " .. tostring(snapped))
-        end
+        local sp = snap(p, 3.0, 8, origin.z, 6)   -- same level as V, not an upper floor
+        if sp then return sp, "navmesh" end
     end
-    for k, v in pairs(why) do log("navmesh " .. k .. ": " .. v) end
+    log("navmesh: no walkable point found near V")
     local fwd = player:GetWorldForward()
     return Vector4.new(origin.x + fwd.x * 30, origin.y + fwd.y * 30, origin.z, 1), "fallback"
 end
@@ -383,15 +387,8 @@ end
 -- Rejects points that moved far (other side of a wall) or changed level
 -- (an interior floor); those suspects stand at the centre instead.
 local function suspectSpot(center, x, y)
-    if NCPD.nav then
-        local ok, p = pcall(function()
-            return NCPD.nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(Vector4.new(x, y, center.z + 1.5, 1), 1.0, 3)
-        end)
-        if ok and p and (p.x ~= 0 or p.y ~= 0) and math.abs(p.z - center.z) < 1.2 then
-            local dx, dy = p.x - x, p.y - y
-            if dx * dx + dy * dy < 1.0 then return p, true end
-        end
-    end
+    local p = snap(Vector4.new(x, y, center.z + 1.5, 1), 1.0, 3, center.z, 1.2)
+    if p and (p.x - x) ^ 2 + (p.y - y) ^ 2 < 1.0 then return p, true end
     return Vector4.new(center.x, center.y, center.z, 1), false
 end
 
@@ -412,8 +409,8 @@ local function writeSpots()
 end
 
 local BANNED_FILE = "ncpd_spots_banned.json"
-NCPD.banned = NCPD.banned or {}         -- cellKey -> true: learned spots that turned out unreachable
-NCPD.bannedSites = NCPD.bannedSites or {}   -- site id -> true: call sites with no walking route
+NCPD.banned = {}        -- cellKey -> true: learned spots that turned out unreachable
+NCPD.bannedSites = {}   -- site id -> true: call sites with no walking route
 
 local function writeBanned()
     local cells, sites = {}, {}
@@ -476,23 +473,18 @@ local function loadSpots()
     end
 end
 
-local function navSystem()
-    if not NCPD.nav then pcall(function() NCPD.nav = Game.GetNavigationSystem() end) end
-    return NCPD.nav
-end
-
 -- Record the walkable floor right under V (street, sidewalk, plaza).
 local function sampleSpot()
-    local nav = navSystem()
-    if not nav then return end
     local o = Game.GetPlayer():GetWorldPosition()
-    local ok, p = pcall(function()
-        return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(Vector4.new(o.x, o.y, o.z + 1.5, 1), 1.0, 3)
-    end)
-    if ok and p and (p.x ~= 0 or p.y ~= 0) and math.abs(p.z - o.z) < 3 then
-        local dx, dy = p.x - o.x, p.y - o.y
-        if dx * dx + dy * dy < 16 then addSpot(p) end
+    local p = snap(Vector4.new(o.x, o.y, o.z + 1.5, 1), 1.0, 3, o.z, 3)
+    if p and (p.x - o.x) ^ 2 + (p.y - o.y) ^ 2 < 16 then addSpot(p) end
+end
+
+local function isRecent(x, y)
+    for _, r in ipairs(NCPD.recent) do
+        if (x - r.x) ^ 2 + (y - r.y) ^ 2 < RECENT_RADIUS * RECENT_RADIUS then return true end
     end
+    return false
 end
 
 local function inVehicle()
@@ -516,12 +508,7 @@ local function pickTarget()
     -- prefer spots away from the last few destinations
     local fresh = {}
     for _, p in ipairs(cands) do
-        local near = false
-        for _, r in ipairs(NCPD.recent) do
-            local dx, dy = p.x - r.x, p.y - r.y
-            if dx * dx + dy * dy < RECENT_RADIUS * RECENT_RADIUS then near = true; break end
-        end
-        if not near then table.insert(fresh, p) end
+        if not isRecent(p.x, p.y) then table.insert(fresh, p) end
     end
     if #fresh > 0 then cands = fresh end
     if #cands > 0 then
@@ -580,14 +567,6 @@ local function logSiteStates()
     for _ in pairs(NCPD.bannedSites) do banned = banned + 1 end
     log(("%d call sites: %d cleared in vanilla (%d have a known finished fact), banned %d"):format(
         #NCPD.sites, cleared, known, banned))
-end
-
-local function isRecent(x, y)
-    for _, r in ipairs(NCPD.recent) do
-        local dx, dy = x - r.x, y - r.y
-        if dx * dx + dy * dy < RECENT_RADIUS * RECENT_RADIUS then return true end
-    end
-    return false
 end
 
 -- A site in the distance band, cleared ones first; else the nearest usable
@@ -650,29 +629,22 @@ end
 
 ---------------------------------------------------------------- GPS objective
 
--- A Contract quest "NCPD Dispatch" with one objective and a GPS map pin is
--- merged into the journal by ncpd_dispatch.archive. During a call the mod
--- activates and tracks the objective (so the game draws the GPS route) and
--- moves its pin to the call. Without it, a plain map pin is used instead.
+-- ncpd_dispatch.archive merges a Contract quest, "NCPD Dispatch", into the
+-- journal. During a call the mod activates and tracks its objectives, so the
+-- game draws the GPS route to the call site's pin. Without the archive (or
+-- away from a site) a plain map pin is used instead.
 local QUEST = "quests/minor_activities/ncpd_dispatch_call"
 local PHASE = QUEST .. "/call"
 local OBJ_CLASS = "gameJournalQuestObjective"
 
-local function jstate(path, cls, state, notify)
-    local ok, r = pcall(function()
-        return Game.GetJournalManager():ChangeEntryState(path, cls, state, notify)
-    end)
-    return ok and r
-end
-
 -- The archive has one objective per call type and gang (gang wars per gang
 -- pair) that names the call, respond_<type>_<gang>[_<rival>], without a pin;
 -- and one objective per call site, scene_<site id> ("Get to the scene:
--- Kabuki"), holding that site's map pin, site_<site id>. (An active objective
--- shows every pin under it, so each site needs its own objective.) A pin's position is
--- fixed in the archive (it can't be moved at runtime), so calls go to those
--- sites. The tracker lists both active objectives; the scene one is tracked
--- for GPS and distance.
+-- Kabuki"), holding that site's map pin, site_<site id>. An active objective
+-- shows every pin under it, so each site needs its own objective. A pin's
+-- position is fixed in the archive (it can't be moved at runtime), so calls
+-- go to those sites. The tracker lists both active objectives; the scene one
+-- is tracked for GPS and distance.
 local function objPath(c)
     local id = "respond_" .. c.type.key .. "_" .. (GANG_SLUG[c.faction] or "")
     if c.faction2 then id = id .. "_" .. (GANG_SLUG[c.faction2] or "") end
@@ -888,7 +860,6 @@ local function endCall(outcome)
             pay = math.floor(pay * 1.5); rep = rep * 2
             NCPD.save.nonlethal = NCPD.save.nonlethal + 1
         end
-        if c.civDead then rep = -rep end
         local before = rankName()
         giveMoney(pay)
         NCPD.save.rep = math.max(0, NCPD.save.rep + rep)
@@ -990,7 +961,6 @@ local function prepareCall()
 end
 
 local function setMappin(c, pos)
-    c.markPos = pos
     -- the site's quest pin can't move: only add a plain pin if the scene
     -- ended up away from it
     if c.questPin and c.site and math.sqrt((pos.x - c.site.x) ^ 2 + (pos.y - c.site.y) ^ 2) <= 30 then
@@ -1018,8 +988,8 @@ local function dispatchCall(prep)
         faction2 = prep.faction2, count2 = prep.count2, boss = prep.boss, backup = prep.backup,
         allies = {}, victims = {}, victimCount = prep.victims or 0,
         state = "enroute", target = target, targetHow = how, pos = target, site = prep.site,
-        suspects = {}, nonlethal = 0, fled = 0, civDead = false,
-        started = NCPD.now, deadline = NCPD.now + 120 + dist / 6,
+        suspects = {}, nonlethal = 0, fled = 0,
+        deadline = NCPD.now + 120 + dist / 6,
     }
     setMappin(c, target)
     questStart(c)
@@ -1054,13 +1024,9 @@ end
 local PATH_DETOUR = 2.5   -- a route this many times the straight line (+60 m) counts as no way in
 
 local function navStart()
-    local nav = navSystem()
-    if not nav then return nil end
     local o = Game.GetPlayer():GetWorldPosition()
-    local ok, p = pcall(function()
-        return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(Vector4.new(o.x, o.y, o.z + 1.5, 1), 2.0, 4)
-    end)
-    if ok and p and (p.x ~= 0 or p.y ~= 0) and Vector4.Distance(p, o) < 6 then return p end
+    local p = snap(Vector4.new(o.x, o.y, o.z + 1.5, 1), 2.0, 4)
+    if p and Vector4.Distance(p, o) < 6 then return p end
 end
 
 local function walkPath(from, to)
@@ -1080,9 +1046,11 @@ local function walkPath(from, to)
     return true, ("path %.0f m"):format(len)
 end
 
--- Find walkable ground at the destination now that its navmesh is loaded,
--- that V can actually walk to. Falls back to a learned spot near the target,
--- then to a spot near V; an unreachable learned target is banned.
+-- Find walkable ground at the destination now that its navmesh is loaded.
+-- Call sites: a point at the site (route only logged), else the site point.
+-- Learned / rough targets: a point V can walk to, else a reachable learned
+-- spot nearby (target banned), else the call is voided ("unreachable"); a
+-- spot near V only if no route check was possible.
 local function sceneCentre(c)
     local nav = navSystem()
     local trusted = c.targetHow == "site" or (c.targetHow or ""):match("^learned")
@@ -1091,18 +1059,17 @@ local function sceneCentre(c)
     local reasons, checked = {}, start ~= nil
     if nav and not start then log("path check skipped: no navmesh under V") end
     -- Call sites are the game's own street-fight areas, so they're reachable;
-    -- the route query gives false "no path" at this range (2 of 2 good sites
-    -- in one test), so for sites it's only logged, never acted on.
+    -- the route query gives false "no path" at this range, so for sites it's
+    -- only logged, never acted on.
     local advisory = c.site ~= nil
     if advisory then checked = false end
     local function reachable(sp)
         if not start then return true end
+        local ok, info = walkPath(start, sp)
         if advisory then
-            local ok, info = walkPath(start, sp)
             c.pathInfo = (ok and "" or "unconfirmed: ") .. tostring(info)
             return true
         end
-        local ok, info = walkPath(start, sp)
         if ok == nil then
             log("path check unavailable: " .. info); start = nil; checked = false
             return true
@@ -1116,8 +1083,8 @@ local function sceneCentre(c)
             local r = (try <= 3) and 0 or ((try <= 8) and 20 or 45)
             local ang = math.random() * math.pi * 2
             local p = Vector4.new(c.target.x + math.cos(ang) * r, c.target.y + math.sin(ang) * r, ref + 4, 1)
-            local ok, sp = pcall(function() return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, 3.0, 8) end)
-            if ok and sp and (sp.x ~= 0 or sp.y ~= 0) and math.abs(sp.z - ref) < 6 and reachable(sp) then
+            local sp = snap(p, 3.0, 8, ref, 6)
+            if sp and reachable(sp) then
                 return sp, "at target" .. ((checked or advisory) and c.pathInfo and (", " .. c.pathInfo) or "")
             end
         end
@@ -1132,10 +1099,8 @@ local function sceneCentre(c)
             table.sort(near, function(a, b) return a.d < b.d end)
             for i = 1, math.min(#near, 6) do
                 local q = near[i].p
-                local ok, sp = pcall(function()
-                    return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(Vector4.new(q.x, q.y, q.z + 2, 1), 2.0, 4)
-                end)
-                if ok and sp and (sp.x ~= 0 or sp.y ~= 0) and reachable(sp) then
+                local sp = snap(Vector4.new(q.x, q.y, q.z + 2, 1), 2.0, 4)
+                if sp and reachable(sp) then
                     log(("target unreachable (%s); moved %.0f m to a learned spot"):format(table.concat(reasons, "; "), near[i].d))
                     banTarget(c, "no walking route")
                     return sp, "nearby spot, " .. c.pathInfo
@@ -1166,18 +1131,14 @@ end
 -- A second walkable spot `dist` metres from `pos` on the same level, for a
 -- rival group, a heavy or backup. `toward` (optional) biases the direction.
 local function offsetCentre(pos, dist, toward)
-    local nav = navSystem()
     local base = toward and angleTo(pos, toward) or (math.random() * math.pi * 2)
-    if nav then
-        for try = 0, 7 do
-            local step = math.floor((try + 1) / 2) * (math.pi / 6)
-            local ang = base + ((try % 2 == 0) and step or -step)
-            local p = Vector4.new(pos.x + math.cos(ang) * dist, pos.y + math.sin(ang) * dist, pos.z + 2, 1)
-            local ok, sp = pcall(function() return nav:GetNearestNavmeshPointBelowOnlyHumanNavmesh(p, 2.0, 4) end)
-            if ok and sp and (sp.x ~= 0 or sp.y ~= 0) and math.abs(sp.z - pos.z) < 2.5 then
-                return sp, true
-            end
-        end
+    for try = 0, 7 do
+        -- straight at `base` first, then fanning out 30 degrees each side
+        local step = math.floor((try + 1) / 2) * (math.pi / 6)
+        local ang = base + ((try % 2 == 0) and step or -step)
+        local sp = snap(Vector4.new(pos.x + math.cos(ang) * dist, pos.y + math.sin(ang) * dist, pos.z + 2, 1),
+            2.0, 4, pos.z, 2.5)
+        if sp then return sp, true end
     end
     return Vector4.new(pos.x, pos.y, pos.z, 1), false
 end
@@ -1327,11 +1288,6 @@ local function resolveOffer(accept, how)
     end
     log("call confirmed (" .. how .. ")")
     local pos = dispatchCall(o.prep)
-    if not pos then
-        say("NCPD DISPATCH", "Disregard, V. Situation resolved.", 5)
-        NCPD.dialog = { lines = { }, t = 0, i = 0, hold = 4 }
-        return
-    end
     text("confirm_ack")
     local dir, dist = compass(Game.GetPlayer():GetWorldPosition(), pos)
     local c = NCPD.call
@@ -1462,13 +1418,15 @@ local function linkAttitudes(c, des)
     end
     local made, failed = 0, 0
     -- hostile both ways; `x` is also pushed to attack `y` straight away
-    local function link(x, y, key)
+    -- (and `y` to attack `x` if `mutual`)
+    local function link(x, y, key, mutual)
         if c.linked[key] then return end
         local ok1 = setAttitude(x, y, EAIAttitude.AIA_Hostile)
         local ok2 = setAttitude(y, x, EAIAttitude.AIA_Hostile)
         c.linked[key] = true
         if ok1 and ok2 then made = made + 1 else failed = failed + 1 end
         injectThreat(c, x, y)
+        if mutual then injectThreat(c, y, x) end
     end
     -- civilians: suspects go after them, so the crime is actually happening
     for vi, v in ipairs(c.victims) do
@@ -1482,8 +1440,7 @@ local function linkAttitudes(c, des)
         for i = 1, #live do
             for j = i + 1, #live do
                 if live[i].s.side ~= live[j].s.side then
-                    link(live[i].e, live[j].e, "s" .. live[i].idx .. ":" .. live[j].idx)
-                    injectThreat(c, live[j].e, live[i].e)
+                    link(live[i].e, live[j].e, "s" .. live[i].idx .. ":" .. live[j].idx, true)
                 end
             end
         end
@@ -1507,8 +1464,9 @@ end
 local function updateCall()
     local c = NCPD.call
     questPin(c)
+    local me = Game.GetPlayer():GetWorldPosition()
     if c.state == "enroute" then
-        local d = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.target)
+        local d = Vector4.Distance(me, c.target)
         if d < 150 then
             local ok, why = spawnScene(c)
             if not ok and why == "unreachable" then
@@ -1523,11 +1481,15 @@ local function updateCall()
         return
     end
     local des = Game.GetDynamicEntitySystem()
+    local dScene = Vector4.Distance(me, c.pos)
+    local here = dScene < 100
     local remaining = 0
     for _, s in ipairs(c.suspects) do
         if not s.done then
             local npc = des:GetEntity(s.id)
-            if not npc and s.seen and Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 100 then
+            if not npc and not here then
+                s.missingSince = nil   -- away from the scene: may just not be streamed in
+            elseif not npc and s.seen then
                 -- seen before, now gone from the world while V is at the
                 -- scene: killed out of sight or despawned; don't block the call
                 s.missingSince = s.missingSince or NCPD.now
@@ -1559,18 +1521,18 @@ local function updateCall()
             end
         end
     end
-    -- attitude links for gang wars / backup, every 30 frames for a while,
+    -- attitude links for gang wars, backup and victims about once a second,
     -- so entities that stream in late (or a heavy) get linked too
     if c.faction2 or #c.allies > 0 or #c.victims > 0 then
         c.linkTick = (c.linkTick or 0) + 1
-        if c.linkTick % 4 == 1 then   -- about once a second
+        if c.linkTick % 4 == 1 then   -- updateCall runs 4x a second
             local ok, err = pcall(linkAttitudes, c, des)
             if not ok then log("attitude link error: " .. tostring(err)) end
         end
     end
 
     -- when V closes in, every suspect turns on V
-    if not c.engagedV and Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 35 then
+    if not c.engagedV and dScene < 35 then
         c.engagedV = true
         c.lastProgress = NCPD.now   -- the stall clocks start when V arrives, not at spawn
         local n = 0
@@ -1584,8 +1546,7 @@ local function updateCall()
     end
 
     -- gang war: bonus if V shows up while both sides are still standing
-    if c.faction2 and not c.arrivalChecked
-        and Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 40 then
+    if c.faction2 and not c.arrivalChecked and dScene < 40 then
         c.arrivalChecked = true
         local alive = { 0, 0 }
         for _, s in ipairs(c.suspects) do
@@ -1610,16 +1571,18 @@ local function updateCall()
             log("heavy warning radioed")
             text("heavy_warning")
         end
-        if c.bossAt and NCPD.now >= c.bossAt then spawnBoss(c); return end   -- count it next frame
-        if c.boss and not c.bossSpawned then return end   -- don't finish before the heavy shows
+        if c.bossAt and NCPD.now >= c.bossAt then spawnBoss(c); return end   -- count it next tick
     end
 
-    if remaining == 0 then endCall("cleared"); return end
+    if remaining == 0 then
+        -- don't finish before a planned heavy shows up (c.boss is cleared if its spawn fails)
+        if c.boss and not c.bossSpawned then return end
+        endCall("cleared"); return
+    end
 
     -- stalled: tell V how many are left and where the nearest one is
     if NCPD.now - c.lastProgress > STALL_HINT and NCPD.now - (c.hintAt or 0) > 30 then
         c.hintAt = NCPD.now
-        local me = Game.GetPlayer():GetWorldPosition()
         local nearest, nd, info = nil, nil, {}
         for _, s in ipairs(c.suspects) do
             if not s.done then
@@ -1642,7 +1605,6 @@ local function updateCall()
     -- Suspects V can't reach (stuck in geometry) shouldn't block the call:
     -- if V is at the scene, someone is already down, and nothing has
     -- changed for a minute, the rest "flee" and the call wraps up.
-    local here = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos) < 100
     local grace = 60
     for _, s in ipairs(c.suspects) do if s.boss and not s.done then grace = BOSS_GRACE end end
     if here and remaining < #c.suspects and NCPD.now - c.lastProgress > grace then
@@ -1659,11 +1621,26 @@ local function updateCall()
     end
 
     -- abandoned if V leaves the scene once it's under way
-    local d = Vector4.Distance(Game.GetPlayer():GetWorldPosition(), c.pos)
-    if d > 400 and NCPD.now - c.arrivedAt > 30 then endCall("abandoned") end
+    if dScene > 400 and NCPD.now - c.arrivedAt > 30 then endCall("abandoned") end
 end
 
 ---------------------------------------------------------------- events
+
+-- Loading a save (or starting a new game) replaces the world: the call's
+-- NPCs and map pins are gone and the journal comes from the save. Forget the
+-- call without touching any of that, and let the next update re-run the
+-- session checks (police switch on, quest and replies off).
+local function resetSession()
+    if NCPD.call or NCPD.ring or NCPD.offer then log("game loaded: active call dropped") end
+    stopSound("ui_phone_incoming_call")
+    NCPD.call, NCPD.ring, NCPD.offer, NCPD.dialog = nil, nil, nil, nil
+    NCPD.cleanupAt = nil
+    NCPD.timer = 0
+    NCPD.recent = {}
+    NCPD.policeOff = false
+    NCPD.policeChecked = false
+    NCPD.greeted, NCPD.greetIn = false, nil
+end
 
 registerForEvent("onInit", function()
     math.randomseed(os.time())
@@ -1671,7 +1648,9 @@ registerForEvent("onInit", function()
     loadSpots()
     loadSites()
     log(("%d learned street spots, %d call sites."):format(#NCPD.spots, #NCPD.sites))
-    log(("v%s loaded. Rank %s, rep %d, on duty: %s."):format(NCPD.version, rankName(), NCPD.save.rep, tostring(NCPD.save.onDuty)))
+    log(("v%s loaded. Standing %s, rep %d, on duty: %s."):format(NCPD.version, rankName(), NCPD.save.rep, tostring(NCPD.save.onDuty)))
+    -- fires each time the player is spawned into a world: every load
+    Observe("PlayerPuppet", "OnGameAttached", function() pcall(resetSession) end)
 end)
 
 registerForEvent("onShutdown", function()
@@ -1707,8 +1686,8 @@ registerHotkey("ncpd_decline", "Decline NCPD call", function()
 end)
 
 registerForEvent("onUpdate", function(dt)
-    NCPD.now = NCPD.now + dt
     if not Game.GetPlayer() or gamePaused() then return end
+    NCPD.now = NCPD.now + dt   -- only while playing: deadlines don't run out in menus
 
     -- after a load (or a crash mid-call) make sure our police switch is on
     if not NCPD.policeChecked then
@@ -1752,7 +1731,7 @@ registerForEvent("onUpdate", function(dt)
         -- 4 checks a second is plenty; every frame just costs CPU in big fights
         NCPD.callTick = (NCPD.callTick or 0) + dt
         if NCPD.callTick >= 0.25 then
-            NCPD.callTick = 0
+            NCPD.callTick = math.min(NCPD.callTick - 0.25, 0.25)   -- keep the remainder, but don't bank a hitch
             local ok, err = pcall(updateCall)
             if not ok then log("update error: " .. tostring(err)) end
         end

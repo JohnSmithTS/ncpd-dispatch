@@ -8,9 +8,7 @@ rm -rf build out && mkdir -p build out
 python3 -I build.py messages.json build
 # JSON -> CR2W next to the json files, then drop the json
 "$WK" convert deserialize build/source -v Minimal
-find build/source -name '*.json.json' -o -name '*.journal.json' | while read -r f; do
-    case "$f" in *.json.json|*.journal.json) rm -f "$f";; esac
-done
+find build/source \( -name '*.json.json' -o -name '*.journal.json' \) -delete
 find build/source -type f
 mkdir -p build/pack/ncpd_dispatch && cp -r build/source/ncpd_dispatch build/pack/ncpd_dispatch/
 "$WK" pack build/pack/ncpd_dispatch -o out -v Minimal
