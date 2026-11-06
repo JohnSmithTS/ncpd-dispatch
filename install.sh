@@ -4,7 +4,9 @@
 #  - phone texts:  archive/pc/mod/ncpd_dispatch.archive(.xl)  (build with phone/build.sh)
 set -e
 HERE="$(dirname "$(readlink -f "$0")")"
-G=~/snap/steam/common/.local/share/Steam/steamapps/common/"Cyberpunk 2077"
+# game folder; default: snap Steam on Linux
+G="${GAME_DIR:-$HOME/snap/steam/common/.local/share/Steam/steamapps/common/Cyberpunk 2077}"
+[ -d "$G/bin/x64" ] || { echo "Game not found at $G (set GAME_DIR)"; exit 1; }
 DEST="$G/bin/x64/plugins/cyber_engine_tweaks/mods/ncpd_dispatch"
 mkdir -p "$DEST"
 cp "$HERE/ncpd_dispatch/init.lua" "$DEST/init.lua"

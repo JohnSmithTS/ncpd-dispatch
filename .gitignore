@@ -5,3 +5,5 @@ ncpd_dispatch/ncpd_spots.json
 ncpd_dispatch/db.sqlite3
 phone/build/
 phone/out/
+dist/
+ncpd_dispatch/ncpd_spots_banned.json
