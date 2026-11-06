@@ -1,0 +1,9 @@
+{
+  "contact": "ncpd_dispatcher",
+  "conversation": "ncpd_dispatch_calls",
+  "conversation_title": "NCPD Dispatch",
+  "messages": [
+    { "id": "test_1", "delay": 2, "text": "NCPD Dispatch to V. Radio check, this is a test message." },
+    { "id": "test_2", "delay": 2, "text": "Second test message. If you can read this twice, repeats work." }
+  ]
+}

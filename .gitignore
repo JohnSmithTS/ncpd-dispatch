@@ -3,3 +3,5 @@ ncpd_dispatch/*.log
 ncpd_dispatch/ncpd_save.json
 ncpd_dispatch/ncpd_spots.json
 ncpd_dispatch/db.sqlite3
+phone/build/
+phone/out/

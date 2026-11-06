@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.4.3",
+    version = "0.5.0-test",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -247,6 +247,31 @@ local function showPanel(title, body, color)
         NCPD.panel = nil
     end
     return ok
+end
+
+-- Real phone texts: entries added to the game's ncpd_dispatcher contact by
+-- ncpd_dispatch.archive (ArchiveXL journal merge). A message is (re)sent by
+-- switching it to Inactive and back to Active with a notification.
+local TEXT_CONTACT = "contacts/ncpd_dispatcher"
+local TEXT_CONV = TEXT_CONTACT .. "/ncpd_dispatch_calls"
+
+function NCPD.sendText(msgId)
+    local jm = Game.GetJournalManager()
+    local path = TEXT_CONV .. "/" .. msgId
+    local steps = {
+        { TEXT_CONTACT, "gameJournalContact", gameJournalEntryState.Active, JournalNotifyOption.DoNotNotify },
+        { TEXT_CONV, "gameJournalPhoneConversation", gameJournalEntryState.Active, JournalNotifyOption.DoNotNotify },
+        { path, "gameJournalPhoneMessage", gameJournalEntryState.Inactive, JournalNotifyOption.DoNotNotify },
+        { path, "gameJournalPhoneMessage", gameJournalEntryState.Active, JournalNotifyOption.Notify },
+    }
+    local results = {}
+    for i, st in ipairs(steps) do
+        local ok, r = pcall(function() return jm:ChangeEntryState(st[1], st[2], st[3], st[4]) end)
+        results[i] = ok and tostring(r) or ("error " .. tostring(r))
+    end
+    local found = pcall(function() return jm:GetEntryByString(path, "gameJournalPhoneMessage") end)
+    log(("text %s: contact %s, conversation %s, reset %s, send %s (entry lookup %s)"):format(
+        msgId, results[1], results[2], results[3], results[4], found and "ok" or "failed"))
 end
 
 -- Show a line in the panel, or as an on-screen message if the panel failed.
@@ -1242,6 +1267,11 @@ registerForEvent("onDraw", function()
         ImGui.SameLine()
         if ImGui.Button("Rebuild NPC pools") then buildPools() end
         ImGui.Separator()
+        if ImGui.CollapsingHeader("Phone texts (test)") then
+            if ImGui.Button("Send test text 1") then NCPD.sendText("test_1") end
+            ImGui.SameLine()
+            if ImGui.Button("Send test text 2") then NCPD.sendText("test_2") end
+        end
         ImGui.Text(("Learned street spots: %d"):format(#NCPD.spots))
         ImGui.TextWrapped("Last: " .. NCPD.lastLog)
     end
