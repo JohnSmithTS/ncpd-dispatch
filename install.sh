@@ -11,6 +11,14 @@ cp "$HERE/ncpd_dispatch/init.lua" "$DEST/init.lua"
 echo "Installed Lua to $DEST. In game: CET overlay -> Reload all mods."
 if [ -f "$HERE/phone/out/ncpd_dispatch.archive" ]; then
     mkdir -p "$G/archive/pc/mod"
-    cp "$HERE/phone/out/ncpd_dispatch.archive" "$HERE/phone/out/ncpd_dispatch.archive.xl" "$G/archive/pc/mod/"
+    # copy to a temp name, then rename: a running game keeps reading the old
+    # file instead of seeing it overwritten in place
+    for f in ncpd_dispatch.archive ncpd_dispatch.archive.xl; do
+        cp "$HERE/phone/out/$f" "$G/archive/pc/mod/.$f.tmp"
+        mv -f "$G/archive/pc/mod/.$f.tmp" "$G/archive/pc/mod/$f"
+    done
+    if pgrep -f '[C]yberpunk2077\.exe' >/dev/null; then
+        echo "Note: the game is running; restart it to load the new phone texts."
+    fi
     echo "Installed phone texts to archive/pc/mod (needs a game restart, not just a CET reload)."
 fi
