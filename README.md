@@ -2,6 +2,8 @@
 
 A Cyberpunk 2077 mod that puts V on NCPD's call list. NCPD is short-handed and pays runners to deal with crimes in progress. Go available, take calls from the NCPD Dispatcher on your phone, follow the GPS to the scene, deal with the suspects, and get paid. Your standing with the precinct grows as you go.
 
+> **Beta (v0.9.x).** Playable and tested in game on Linux (Proton), but still in progress: the answer/decline hotkeys, surprise heavies and pausing mid-call haven't been fully tested with the current version, and it hasn't been tried on Windows yet. Please [open an issue](https://github.com/JohnSmithTS/ncpd-dispatch/issues) with `ncpd_dispatch.log` (in the mod's CET folder) if something goes wrong.
+
 ## Features
 
 - **Dispatch by phone.** The phone rings, and the call arrives as a text from the game's own **NCPD Dispatcher** contact. Reply "I'm on it." or decline, in the phone or with hotkeys. If you don't reply within 45 seconds, the job goes to someone else.
