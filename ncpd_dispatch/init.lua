@@ -6,7 +6,7 @@
 -- Needs Cyber Engine Tweaks + Codeware (DynamicEntitySystem).
 
 local NCPD = {
-    version = "0.4.2",
+    version = "0.4.3",
     tag = "NCPDDispatch",
     overlayOpen = false,
     timer = 0,
@@ -1020,7 +1020,7 @@ local function updateCall()
     -- so entities that stream in late (or a heavy) get linked too
     if c.faction2 or #c.allies > 0 or #c.victims > 0 then
         c.linkTick = (c.linkTick or 0) + 1
-        if c.linkTick % 30 == 1 then
+        if c.linkTick % 4 == 1 then   -- about once a second
             local ok, err = pcall(linkAttitudes, c, des)
             if not ok then log("attitude link error: " .. tostring(err)) end
         end
@@ -1170,8 +1170,13 @@ registerForEvent("onUpdate", function(dt)
     end
 
     if NCPD.call then
-        local ok, err = pcall(updateCall)
-        if not ok then log("update error: " .. tostring(err)) end
+        -- 4 checks a second is plenty; every frame just costs CPU in big fights
+        NCPD.callTick = (NCPD.callTick or 0) + dt
+        if NCPD.callTick >= 0.25 then
+            NCPD.callTick = 0
+            local ok, err = pcall(updateCall)
+            if not ok then log("update error: " .. tostring(err)) end
+        end
     elseif NCPD.save.onDuty and NCPD.save.autoDispatch and not NCPD.ring and not NCPD.dialog then
         NCPD.timer = NCPD.timer + dt
         if NCPD.timer >= NCPD.save.dispatchEvery then
