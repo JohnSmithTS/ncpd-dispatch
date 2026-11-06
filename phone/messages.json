@@ -7,11 +7,15 @@
     "id": "ncpd_dispatch_call",
     "type": "Contract",
     "variant": "DefaultQuestVariant",
-    "start": [
-      -1400.0,
-      1700.0,
-      18.0
-    ],
+    "anchor": {
+      "node": "#coyote_performance_test",
+      "pos": [
+        -1259.71252,
+        -988.872009,
+        12.037246
+      ],
+      "note": "El Coyote Cojo; always-loaded base-game node (position from andreaolivato/cyberpunk-codes find_pin_anchors, game 2.31)"
+    },
     "title": "NCPD Dispatch",
     "description": "Dispatch has a crime in progress for you. Get to the scene, deal with the suspects and keep the civilians alive.",
     "objectives": {

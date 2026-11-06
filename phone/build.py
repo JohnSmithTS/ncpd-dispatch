@@ -118,20 +118,23 @@ def make_objective(oid):
             "$type": "gamemappinsMappinData",
             "active": 1,
             "debugCaption": "",
-            "localizedCaption": {"unk1": "0", "value": ""},
+            # the pin's name on the map: the objective text
+            "localizedCaption": loc("quest_obj_" + oid),
             "mappinType": ref_none("TweakDBID", "string", "Mappins.QuestStaticMappinDefinition"),
             "scriptData": None,
             "variant": q.get("variant", "DefaultQuestVariant"),
             "visibleThroughWalls": 1,
         },
-        # no node reference: ArchiveXL uses the offset as a world position;
-        # the mod moves the pin to each call with MappinSystem.SetMappinPosition
-        "offset": {"$type": "Vector3", "X": q["start"][0], "Y": q["start"][1], "Z": q["start"][2]},
+        # A quest pin with no node reference is never spawned. ArchiveXL puts
+        # it at anchor node + offset; the anchor is a base-game node in an
+        # always-loaded sector, so it resolves wherever V is. The mod then
+        # moves the pin to each call with MappinSystem.SetMappinPosition.
+        "offset": {"$type": "Vector3", "X": 0.0, "Y": 0.0, "Z": 0.5},
         "reference": {
             "$type": "gameEntityReference",
             "dynamicEntityUniqueName": ref_none("CName"),
             "names": [],
-            "reference": ref_none("NodeRef", "uint64", "0"),
+            "reference": {"$type": "NodeRef", "$storage": "string", "$value": q["anchor"]["node"]},
             "sceneActorContextName": ref_none("CName"),
             "slotName": ref_none("CName"),
             "type": "EntityRef",

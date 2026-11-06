@@ -615,14 +615,16 @@ local function questStart(c)
     local okQ = jstate(QUEST, "gameJournalQuest", gameJournalEntryState.Active, Q)
     local okP = jstate(PHASE, "gameJournalQuestPhase", gameJournalEntryState.Active, Q)
     local okO = jstate(c.obj, OBJ_CLASS, gameJournalEntryState.Active, JournalNotifyOption.Notify)
+    -- the pin is its own journal entry; an Inactive pin is never spawned
+    local okM = jstate(c.obj .. "/call_mappin", "gameJournalQuestMapPin", gameJournalEntryState.Active, Q)
     local tracked = pcall(function()
         local jm = Game.GetJournalManager()
         jm:TrackEntry(jm:GetEntryByString(c.obj, OBJ_CLASS))
     end)
     c.questOn = true
     c.pinTries = 0
-    log(("GPS objective %s: quest %s, phase %s, objective %s, tracked %s"):format(
-        c.obj:match("[^/]+$"), tostring(okQ), tostring(okP), tostring(okO), tostring(tracked)))
+    log(("GPS objective %s: quest %s, phase %s, objective %s, pin %s, tracked %s"):format(
+        c.obj:match("[^/]+$"), tostring(okQ), tostring(okP), tostring(okO), tostring(okM), tostring(tracked)))
 end
 
 -- Find the objective's map pin (it registers a moment after activation)
